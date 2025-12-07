@@ -1,0 +1,10 @@
+Flask
+twilio
+openai>=1.0.0
+python-dotenv
+gunicorn
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+google-cloud

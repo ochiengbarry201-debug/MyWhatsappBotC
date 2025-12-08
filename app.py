@@ -2,6 +2,7 @@ import os
 import sqlite3
 import datetime
 import re
+import json
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
@@ -15,14 +16,37 @@ from openai import OpenAI
 
 # --- Load environment ---
 load_dotenv()
+
+# ============================
+#  GOOGLE SHEETS FIX (Render)
+# ============================
+SERVICE_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
+GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", "").strip()
+
+creds = None
+sheets_api = None
+
+if SERVICE_JSON:
+    try:
+        service_info = json.loads(SERVICE_JSON)   # <-- FIXES Expecting value error
+        SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(service_info, scopes=SCOPES)
+        sheets_service = build("sheets", "v4", credentials=creds)
+        sheets_api = sheets_service.spreadsheets()
+        print("Google Sheets initialized")
+    except Exception as e:
+        print("Google Sheets init failed:", e)
+else:
+    print("SERVICE_ACCOUNT_JSON not set — Sheets disabled.")
+
+
+# --- ENV variables ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
-GOOGLE_SERVICE_JSON = os.getenv("GOOGLE_SERVICE_JSON", "service_account.json")
-GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", "").strip()
-ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "whatsapp:+254746346234")  
+ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "whatsapp:+254746346234")
 CLINIC_NAME = os.getenv("CLINIC_NAME", "PrimeCare Medical Centre")
 
-# --- Initialize clients & services ---
+# --- OpenAI Client ---
 openai_client = None
 if OPENAI_API_KEY:
     try:
@@ -33,21 +57,6 @@ if OPENAI_API_KEY:
 else:
     print("Warning: OPENAI_API_KEY not set — fallback assistant only.")
 
-sheets_api = None
-if GOOGLE_SHEETS_ID and os.path.exists(GOOGLE_SERVICE_JSON):
-    try:
-        SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_file(GOOGLE_SERVICE_JSON, scopes=SCOPES)
-        sheets_service = build("sheets", "v4", credentials=creds)
-        sheets_api = sheets_service.spreadsheets()
-        print("Google Sheets initialized")
-    except Exception as e:
-        print("Google Sheets init failed:", e)
-else:
-    if not GOOGLE_SHEETS_ID:
-        print("GOOGLE_SHEETS_ID not set; Sheets disabled.")
-    else:
-        print("Google service JSON not found at", GOOGLE_SERVICE_JSON)
 
 # --- Database ---
 DB_FILE = "clinic_advanced.db"
@@ -56,6 +65,7 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
 
+    # messages memory
     c.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +76,7 @@ def init_db():
         )
     """)
 
+    # context memory
     c.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             user_number TEXT PRIMARY KEY,
@@ -73,6 +84,7 @@ def init_db():
         )
     """)
 
+    # appointments
     c.execute("""
         CREATE TABLE IF NOT EXISTS appointments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,7 +103,7 @@ def init_db():
 
 init_db()
 
-# --- Helpers ---
+# --- DB Helpers ---
 def db_conn():
     return sqlite3.connect(DB_FILE)
 
@@ -130,9 +142,9 @@ def set_context(user, ctx):
 def clear_context(user):
     set_context(user, "")
 
-# === MUST BE ABOVE BOOKING FLOW (THE FIX) ===
+
+# --- Double Booking Check ---
 def check_double_booking(date, time):
-    # local DB check
     conn = db_conn()
     c = conn.cursor()
     c.execute("SELECT id FROM appointments WHERE date=? AND time=? AND status='Booked'", (date, time))
@@ -141,7 +153,6 @@ def check_double_booking(date, time):
     if r:
         return True
 
-    # Google Sheets check
     if not sheets_api:
         return False
 
@@ -158,6 +169,7 @@ def check_double_booking(date, time):
         print("Google check error:", e)
 
     return False
+
 
 # --- Validators ---
 def looks_like_date(s):
@@ -179,7 +191,8 @@ def looks_like_time(s):
         except:
             return False
 
-# --- Booking intent detection ---
+
+# --- Booking Keywords ---
 BOOKING_KEYWORDS = [
     "book", "appointment", "schedule", "dentist", "doctor",
     "see a doctor", "clinic", "visit", "pain", "booking"
@@ -192,13 +205,13 @@ def is_booking_intent(text):
             return True
     return False
 
-# --- AI Replies ---
-SYSTEM_PROMPT = f"""
-You are the friendly receptionist bot for {CLINIC_NAME}.
-Keep replies short and helpful. Do NOT book appointments yourself —
-the backend handles booking. If user mentions pain or asks to see a doctor,
-be comforting and guide them naturally.
+
+# --- AI PROMPT ---
+SYSTEM_PROMPT = """
+You are the receptionist bot for a medical clinic. Keep replies short and helpful.
+If user wants to book, guide them into the correct flow.
 """
+
 
 def ai_reply(user, msg):
     if not openai_client:
@@ -217,9 +230,10 @@ def ai_reply(user, msg):
         return res.choices[0].message.content.strip()
     except Exception as e:
         print("AI error:", e)
-        return f"Sorry, I'm having trouble. You can say 'book' to start an appointment."
+        return "Sorry, something went wrong. Try again."
 
-# --- Save appointment ---
+
+# --- Save Appointment ---
 def save_appointment_local(user, name, date, time):
     conn = db_conn()
     c = conn.cursor()
@@ -247,6 +261,7 @@ def append_to_sheet(date, time, name, phone):
     except:
         return False
 
+
 # --- Flask App ---
 app = Flask(__name__)
 
@@ -262,17 +277,18 @@ def whatsapp_webhook():
     save_message(user, "user", incoming)
     context = get_context(user)
 
-    # Reset
+    # RESET
     if incoming.lower() == "reset":
         clear_context(user)
-        reply = f"Your session has been reset. You may start booking again at {CLINIC_NAME}."
+        reply = f"Your session has been reset. Start again anytime at {CLINIC_NAME}."
         msg.body(reply)
         save_message(user, "assistant", reply)
         return str(resp)
 
-    # Admin View
-    if (incoming.lower().startswith("show appts") or "show appointments" in incoming.lower()) and \
-        f"whatsapp:{user}" == ADMIN_WHATSAPP:
+    # ADMIN VIEW APPOINTMENTS
+    if (incoming.lower().startswith("show appts") or "show appointments" in incoming.lower()) \
+        and f"whatsapp:{user}" == ADMIN_WHATSAPP:
+
         conn = db_conn()
         c = conn.cursor()
         c.execute("SELECT id, name, date, time, status FROM appointments ORDER BY created_at DESC LIMIT 30")
@@ -284,9 +300,10 @@ def whatsapp_webhook():
         else:
             text = "\n".join([f"{r[0]} - {r[1]} - {r[2]} {r[3]} ({r[4]})" for r in rows])
             msg.body("Recent appointments:\n" + text)
+
         return str(resp)
 
-    # Admin Cancel
+    # ADMIN CANCEL APPOINTMENT
     m = re.match(r"cancel\s+(\d+)", incoming.lower())
     if m and f"whatsapp:{user}" == ADMIN_WHATSAPP:
         appt_id = int(m.group(1))
@@ -300,7 +317,9 @@ def whatsapp_webhook():
             msg.body("Not found.")
         return str(resp)
 
-    # === BOOKING FLOW ===
+    # -------------------
+    # BOOKING FLOW
+    # -------------------
 
     if context == "awaiting_name":
         name = incoming.strip()
@@ -333,7 +352,7 @@ def whatsapp_webhook():
             time = incoming.strip()
 
             if check_double_booking(date, time):
-                reply = "Sorry, that slot is already booked. Please choose another time."
+                reply = "Sorry, that slot is already booked. Choose another time."
                 msg.body(reply)
                 save_message(user, "assistant", reply)
                 return str(resp)
@@ -343,6 +362,7 @@ def whatsapp_webhook():
             msg.body(reply)
             save_message(user, "assistant", reply)
             return str(resp)
+
         else:
             ai = ai_reply(user, incoming)
             msg.body(ai)
@@ -356,10 +376,9 @@ def whatsapp_webhook():
         time = parts[2].split("time:", 1)[1]
 
         if incoming.lower() in ["yes", "y", "confirm", "sure"]:
-            # final double booking check
             if check_double_booking(date, time):
                 set_context(user, f"name:{name}|date:{date}")
-                reply = "Sorry — this slot was just taken. Please choose another time."
+                reply = "That slot got booked. Please choose another time."
                 msg.body(reply)
                 save_message(user, "assistant", reply)
                 return str(resp)
@@ -368,14 +387,14 @@ def whatsapp_webhook():
             append_to_sheet(date, time, name, user)
 
             set_context(user, "done")
-            reply = f"✔️ Appointment confirmed for {date} at {time}. Your ID is {appt_id}. Thank you for choosing {CLINIC_NAME}."
+            reply = f"✔️ Appointment confirmed for {date} at {time}. ID: {appt_id}."
             msg.body(reply)
             save_message(user, "assistant", reply)
             return str(resp)
 
         if incoming.lower() in ["no", "n"]:
             set_context(user, f"name:{name}|date:{date}")
-            reply = "Okay. Please provide another time."
+            reply = "Okay. Provide another time."
             msg.body(reply)
             save_message(user, "assistant", reply)
             return str(resp)
@@ -383,7 +402,7 @@ def whatsapp_webhook():
         msg.body("Please reply 'yes' or 'no'.")
         return str(resp)
 
-    # NEW BOOKING FLOW START
+    # NEW BOOKING START
     if is_booking_intent(incoming):
         set_context(user, "awaiting_name")
         reply = f"Sure — I can help you book an appointment at {CLINIC_NAME}. What's your full name?"
@@ -391,13 +410,14 @@ def whatsapp_webhook():
         save_message(user, "assistant", reply)
         return str(resp)
 
-    # Default assistant
+    # DEFAULT AI RESPONSE
     reply = ai_reply(user, incoming)
     msg.body(reply)
     save_message(user, "assistant", reply)
     return str(resp)
 
-# Admin web view
+
+# --- Admin Web View ---
 @app.route("/appointments", methods=["GET"])
 def view_appointments():
     conn = db_conn()
@@ -415,8 +435,10 @@ def view_appointments():
     html += "</table>"
     return html
 
-# Run
+
+# --- Run ---
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting {CLINIC_NAME} bot on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
+

@@ -1,4 +1,3 @@
-
 import os
 import sqlite3
 import psycopg2
@@ -139,6 +138,7 @@ def init_db():
 
     conn.commit()
     conn.close()
+    print("PostgreSQL tables checked/created successfully")
 
 init_db()
 

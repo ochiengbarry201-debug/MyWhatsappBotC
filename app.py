@@ -69,8 +69,11 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 LOCAL_DB = "clinic_local.db"
 
 def db_conn():
+    # Helpful debug so you always know what's being used
     if DATABASE_URL:
+        print("DB: USING POSTGRESQL")
         return psycopg2.connect(DATABASE_URL)
+    print("DB: USING SQLITE:", os.path.abspath(LOCAL_DB))
     return sqlite3.connect(LOCAL_DB)
 
 def init_db():
@@ -138,7 +141,7 @@ def init_db():
 
     conn.commit()
     conn.close()
-    print("PostgreSQL tables checked/created successfully")
+    print("DB tables checked/created successfully")
 
 init_db()
 
@@ -263,9 +266,12 @@ def looks_like_time(s):
 # -------------------------------------------------
 # Booking intent
 # -------------------------------------------------
+# EXPANDED to catch dental/clinic style messages better
 BOOKING_KEYWORDS = [
-    "book", "appointment", "schedule", "doctor",
-    "clinic", "visit", "pain"
+    "book", "booking", "appointment", "schedule", "reschedule", "cancel",
+    "doctor", "clinic", "visit",
+    "dentist", "dental", "tooth", "teeth", "toothache", "gum", "braces",
+    "cleaning", "checkup", "check-up", "pain", "ache"
 ]
 
 def is_booking_intent(text):
@@ -275,10 +281,15 @@ def is_booking_intent(text):
 # -------------------------------------------------
 # AI Reply
 # -------------------------------------------------
-SYSTEM_PROMPT = """
-You are a medical clinic receptionist.
+# UPDATED so AI never “pretends” booking happened
+SYSTEM_PROMPT = f"""
+You are a medical clinic receptionist for {CLINIC_NAME}.
 Keep replies short, polite, and helpful.
-Guide users to booking when appropriate.
+
+CRITICAL RULES:
+- Never claim an appointment is booked, confirmed, set, or scheduled.
+- Only confirm appointments after the booking flow asks for date, time, and receives a "yes".
+- If a user wants an appointment, tell them to type "book" to start the booking.
 """
 
 def ai_reply(user, msg):
@@ -332,6 +343,11 @@ def append_to_sheet(date, time, name, phone):
 # -------------------------------------------------
 app = Flask(__name__)
 
+# Health route (stops Render GET / 404 spam)
+@app.get("/")
+def home():
+    return "OK", 200
+
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_webhook():
     incoming = request.values.get("Body", "").strip()
@@ -363,7 +379,13 @@ def whatsapp_webhook():
         if looks_like_date(incoming):
             name = context.split("name:", 1)[1]
             set_context(user, f"name:{name}|date:{incoming}")
-            reply = "What time would you prefer? (HH:MM)"
+            reply = "What time would you prefer? (HH:MM) e.g. 14:00"
+            msg.body(reply)
+            save_message(user, "assistant", reply)
+            return str(resp)
+        else:
+            # NEW: don’t silently fall through
+            reply = "Please type the date like 2026-01-15 (YYYY-MM-DD)."
             msg.body(reply)
             save_message(user, "assistant", reply)
             return str(resp)
@@ -375,11 +397,19 @@ def whatsapp_webhook():
             date = parts[1].split("date:", 1)[1]
 
             if check_double_booking(date, incoming):
-                msg.body("That slot is already booked. Choose another time.")
+                reply = "That slot is already booked. Choose another time."
+                msg.body(reply)
+                save_message(user, "assistant", reply)
                 return str(resp)
 
             set_context(user, f"name:{name}|date:{date}|time:{incoming}")
             reply = f"Confirm appointment on {date} at {incoming}? (yes/no)"
+            msg.body(reply)
+            save_message(user, "assistant", reply)
+            return str(resp)
+        else:
+            # NEW: don’t silently fall through
+            reply = "Please type the time like 09:30 (HH:MM) e.g. 14:00."
             msg.body(reply)
             save_message(user, "assistant", reply)
             return str(resp)
@@ -400,13 +430,36 @@ def whatsapp_webhook():
             save_message(user, "assistant", reply)
             return str(resp)
 
-    if is_booking_intent(incoming):
-        set_context(user, "awaiting_name")
-        reply = f"Sure. What's your full name?"
+        if incoming.lower() in ["no", "n"]:
+            clear_context(user)
+            reply = "No problem — booking cancelled. Type 'book' to start again."
+            msg.body(reply)
+            save_message(user, "assistant", reply)
+            return str(resp)
+
+        # NEW: if they type something else at confirm stage
+        reply = "Please reply with 'yes' to confirm or 'no' to cancel."
         msg.body(reply)
         save_message(user, "assistant", reply)
         return str(resp)
 
+    # If user is trying to book, start the real booking flow
+    if is_booking_intent(incoming):
+        set_context(user, "awaiting_name")
+        reply = "Sure. What's your full name?"
+        msg.body(reply)
+        save_message(user, "assistant", reply)
+        return str(resp)
+
+    # NEW: safety nudge to prevent AI “fake booking” if they mention dental/pain etc.
+    maybe_booking_words = ["dent", "tooth", "teeth", "pain", "ache", "clean", "check", "braces", "gum"]
+    if any(w in incoming.lower() for w in maybe_booking_words):
+        reply = "If you'd like to book an appointment, please type 'book'."
+        msg.body(reply)
+        save_message(user, "assistant", reply)
+        return str(resp)
+
+    # Otherwise, use AI for general replies (but AI is now instructed not to confirm bookings)
     reply = ai_reply(user, incoming)
     msg.body(reply)
     save_message(user, "assistant", reply)
@@ -419,3 +472,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting {CLINIC_NAME} bot on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
+

@@ -31,13 +31,24 @@ sheets_api = None
 if SERVICE_JSON:
     try:
         service_info = json.loads(SERVICE_JSON)
+        print("Sheets target ID:", GOOGLE_SHEETS_ID)
+        print("Service account email:", service_info.get("client_email"))
+
         SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_info(service_info, scopes=SCOPES)
         sheets_service = build("sheets", "v4", credentials=creds)
         sheets_api = sheets_service.spreadsheets()
         print("Google Sheets initialized")
+
+        # TEMP: Confirm access to the spreadsheet ID (helps debug 404 issues)
+        try:
+            meta = sheets_api.get(spreadsheetId=GOOGLE_SHEETS_ID).execute()
+            print("Sheets access OK. Title:", meta.get("properties", {}).get("title"))
+        except Exception as e:
+            print("Sheets access TEST FAILED:", repr(e))
+
     except Exception as e:
-        print("Google Sheets init failed:", e)
+        print("Google Sheets init failed:", repr(e))
 else:
     print("SERVICE_ACCOUNT_JSON not set — Sheets disabled")
 
@@ -58,7 +69,7 @@ if OPENAI_API_KEY:
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
         print("OpenAI client initialized")
     except Exception as e:
-        print("OpenAI init error:", e)
+        print("OpenAI init error:", repr(e))
 else:
     print("Warning: OPENAI_API_KEY not set — AI replies disabled")
 
@@ -238,7 +249,7 @@ def check_double_booking(date, time):
             if len(row) >= 2 and row[0] == date and row[1] == time:
                 return True
     except Exception as e:
-        print("Sheets check error:", e)
+        print("Sheets check error:", repr(e))
 
     return False
 
@@ -308,7 +319,7 @@ def ai_reply(user, msg):
         )
         return res.choices[0].message.content.strip()
     except Exception as e:
-        print("AI error:", e)
+        print("AI error:", repr(e))
         return "Sorry, something went wrong."
 
 # -------------------------------------------------
@@ -349,7 +360,6 @@ def append_to_sheet(date, time, name, phone):
         print("Sheets append OK:", date, time, name, phone)
     except Exception as e:
         print("Sheets append FAILED:", repr(e))
-
 
 # -------------------------------------------------
 # Flask App
@@ -485,4 +495,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting {CLINIC_NAME} bot on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
-

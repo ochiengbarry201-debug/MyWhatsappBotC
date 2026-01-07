@@ -329,14 +329,27 @@ def save_appointment_local(user, name, date, time):
     return appt_id
 
 def append_to_sheet(date, time, name, phone):
+    # If Sheets wasn't initialized, skip but LOG why
     if not sheets_api:
+        print("Sheets append skipped: sheets_api is None (Sheets not initialized).")
+        print("Check SERVICE_ACCOUNT_JSON and GOOGLE_SHEETS_ID env vars.")
         return
-    sheets_api.values().append(
-        spreadsheetId=GOOGLE_SHEETS_ID,
-        range="Sheet1!A:E",
-        valueInputOption="RAW",
-        body={"values": [[date, time, name, phone, "WhatsApp"]]}
-    ).execute()
+
+    if not GOOGLE_SHEETS_ID:
+        print("Sheets append skipped: GOOGLE_SHEETS_ID is empty.")
+        return
+
+    try:
+        sheets_api.values().append(
+            spreadsheetId=GOOGLE_SHEETS_ID,
+            range="Sheet1!A:E",
+            valueInputOption="RAW",
+            body={"values": [[date, time, name, phone, "WhatsApp"]]}
+        ).execute()
+        print("Sheets append OK:", date, time, name, phone)
+    except Exception as e:
+        print("Sheets append FAILED:", repr(e))
+
 
 # -------------------------------------------------
 # Flask App

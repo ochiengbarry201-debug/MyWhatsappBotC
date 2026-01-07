@@ -353,9 +353,9 @@ def append_to_sheet(date, time, name, phone):
     try:
         sheets_api.values().append(
             spreadsheetId=GOOGLE_SHEETS_ID,
-            range="Sheet1!A:E",
+            range="Sheet1!A:K",
             valueInputOption="RAW",
-            body={"values": [[date, time, name, phone, "WhatsApp"]]}
+            body={"values": [[date, "", time, "", name, "", phone, "", booked, "", "WhatsApp"]]}
         ).execute()
         print("Sheets append OK:", date, time, name, phone)
     except Exception as e:

@@ -4,7 +4,7 @@ import psycopg2
 import datetime
 import re
 import json
-from flask import Flask, request
+from flask import Flask, request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
 
@@ -277,7 +277,6 @@ def looks_like_time(s):
 # -------------------------------------------------
 # Booking intent
 # -------------------------------------------------
-# EXPANDED to catch dental/clinic style messages better
 BOOKING_KEYWORDS = [
     "book", "booking", "appointment", "schedule", "reschedule", "cancel",
     "doctor", "clinic", "visit",
@@ -292,7 +291,6 @@ def is_booking_intent(text):
 # -------------------------------------------------
 # AI Reply
 # -------------------------------------------------
-# UPDATED so AI never “pretends” booking happened
 SYSTEM_PROMPT = f"""
 You are a medical clinic receptionist for {CLINIC_NAME}.
 Keep replies short, polite, and helpful.
@@ -351,11 +349,14 @@ def append_to_sheet(date, time, name, phone):
         return
 
     try:
+        # A:K layout (matches your current sheet spacing)
         sheets_api.values().append(
             spreadsheetId=GOOGLE_SHEETS_ID,
             range="Sheet1!A:K",
             valueInputOption="RAW",
-            body={"values": [[date, "", time, "", name, "", phone, "", booked, "", "WhatsApp"]]}
+            body={"values": [[
+                date, "", time, "", name, "", phone, "", "Booked", "", "WhatsApp"
+            ]]}
         ).execute()
         print("Sheets append OK:", date, time, name, phone)
     except Exception as e:
@@ -366,7 +367,6 @@ def append_to_sheet(date, time, name, phone):
 # -------------------------------------------------
 app = Flask(__name__)
 
-# Health route (stops Render GET / 404 spam)
 @app.get("/")
 def home():
     return "OK", 200
@@ -388,7 +388,8 @@ def whatsapp_webhook():
         reply = "Session reset. You can start again."
         msg.body(reply)
         save_message(user, "assistant", reply)
-        return str(resp)
+        print("TWIML OUT:", str(resp))
+        return Response(str(resp), mimetype="application/xml")
 
     # Booking flow
     if context == "awaiting_name":
@@ -396,7 +397,8 @@ def whatsapp_webhook():
         reply = "What date would you like? (YYYY-MM-DD)"
         msg.body(reply)
         save_message(user, "assistant", reply)
-        return str(resp)
+        print("TWIML OUT:", str(resp))
+        return Response(str(resp), mimetype="application/xml")
 
     if context.startswith("name:") and "|date:" not in context:
         if looks_like_date(incoming):
@@ -405,13 +407,14 @@ def whatsapp_webhook():
             reply = "What time would you prefer? (HH:MM) e.g. 14:00"
             msg.body(reply)
             save_message(user, "assistant", reply)
-            return str(resp)
+            print("TWIML OUT:", str(resp))
+            return Response(str(resp), mimetype="application/xml")
         else:
-            # NEW: don’t silently fall through
             reply = "Please type the date like 2026-01-15 (YYYY-MM-DD)."
             msg.body(reply)
             save_message(user, "assistant", reply)
-            return str(resp)
+            print("TWIML OUT:", str(resp))
+            return Response(str(resp), mimetype="application/xml")
 
     if "|date:" in context and "|time:" not in context:
         if looks_like_time(incoming):
@@ -423,19 +426,21 @@ def whatsapp_webhook():
                 reply = "That slot is already booked. Choose another time."
                 msg.body(reply)
                 save_message(user, "assistant", reply)
-                return str(resp)
+                print("TWIML OUT:", str(resp))
+                return Response(str(resp), mimetype="application/xml")
 
             set_context(user, f"name:{name}|date:{date}|time:{incoming}")
             reply = f"Confirm appointment on {date} at {incoming}? (yes/no)"
             msg.body(reply)
             save_message(user, "assistant", reply)
-            return str(resp)
+            print("TWIML OUT:", str(resp))
+            return Response(str(resp), mimetype="application/xml")
         else:
-            # NEW: don’t silently fall through
             reply = "Please type the time like 09:30 (HH:MM) e.g. 14:00."
             msg.body(reply)
             save_message(user, "assistant", reply)
-            return str(resp)
+            print("TWIML OUT:", str(resp))
+            return Response(str(resp), mimetype="application/xml")
 
     if "|time:" in context:
         if incoming.lower() in ["yes", "y"]:
@@ -451,20 +456,22 @@ def whatsapp_webhook():
             reply = f"✅ Appointment confirmed for {date} at {time}"
             msg.body(reply)
             save_message(user, "assistant", reply)
-            return str(resp)
+            print("TWIML OUT:", str(resp))
+            return Response(str(resp), mimetype="application/xml")
 
         if incoming.lower() in ["no", "n"]:
             clear_context(user)
             reply = "No problem — booking cancelled. Type 'book' to start again."
             msg.body(reply)
             save_message(user, "assistant", reply)
-            return str(resp)
+            print("TWIML OUT:", str(resp))
+            return Response(str(resp), mimetype="application/xml")
 
-        # NEW: if they type something else at confirm stage
         reply = "Please reply with 'yes' to confirm or 'no' to cancel."
         msg.body(reply)
         save_message(user, "assistant", reply)
-        return str(resp)
+        print("TWIML OUT:", str(resp))
+        return Response(str(resp), mimetype="application/xml")
 
     # If user is trying to book, start the real booking flow
     if is_booking_intent(incoming):
@@ -472,21 +479,24 @@ def whatsapp_webhook():
         reply = "Sure. What's your full name?"
         msg.body(reply)
         save_message(user, "assistant", reply)
-        return str(resp)
+        print("TWIML OUT:", str(resp))
+        return Response(str(resp), mimetype="application/xml")
 
-    # NEW: safety nudge to prevent AI “fake booking” if they mention dental/pain etc.
+    # Safety nudge
     maybe_booking_words = ["dent", "tooth", "teeth", "pain", "ache", "clean", "check", "braces", "gum"]
     if any(w in incoming.lower() for w in maybe_booking_words):
         reply = "If you'd like to book an appointment, please type 'book'."
         msg.body(reply)
         save_message(user, "assistant", reply)
-        return str(resp)
+        print("TWIML OUT:", str(resp))
+        return Response(str(resp), mimetype="application/xml")
 
-    # Otherwise, use AI for general replies (but AI is now instructed not to confirm bookings)
+    # Otherwise, use AI for general replies
     reply = ai_reply(user, incoming)
     msg.body(reply)
     save_message(user, "assistant", reply)
-    return str(resp)
+    print("TWIML OUT:", str(resp))
+    return Response(str(resp), mimetype="application/xml")
 
 # -------------------------------------------------
 # Run

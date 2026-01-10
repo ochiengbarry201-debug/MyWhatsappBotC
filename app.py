@@ -352,8 +352,9 @@ def append_to_sheet(date, time, name, phone):
         # A:K layout (matches your current sheet spacing)
         sheets_api.values().append(
             spreadsheetId=GOOGLE_SHEETS_ID,
-            range="Sheet1!A:K",
+            range="Sheet1!A1",
             valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
             body={"values": [[
                 date, "", time, "", name, "", phone, "", "Booked", "", "WhatsApp"
             ]]}

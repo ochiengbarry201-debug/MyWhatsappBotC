@@ -1,5 +1,4 @@
 import os
-import sqlite3
 import psycopg2
 import datetime
 import re
@@ -20,44 +19,75 @@ from openai import OpenAI
 # -------------------------------------------------
 load_dotenv()
 
+# Debug: confirm env vars are loading (safe booleans only)
+print("LOCAL DATABASE_URL exists?", bool(os.getenv("DATABASE_URL")))
+print("LOCAL SERVICE_ACCOUNT_JSON exists?", bool(os.getenv("SERVICE_ACCOUNT_JSON")))
+print("LOCAL SERVICE_ACCOUNT_FILE exists?", bool(os.getenv("SERVICE_ACCOUNT_FILE")))
+print("LOCAL GOOGLE_SHEETS_ID exists?", bool(os.getenv("GOOGLE_SHEETS_ID")))
+
 # -------------------------------------------------
-# Google Sheets (Render-safe)
+# Google Sheets (Local file OR Render-safe JSON)
 # -------------------------------------------------
-SERVICE_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
+SERVICE_JSON = os.getenv("SERVICE_ACCOUNT_JSON", "").strip()
+SERVICE_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "").strip()
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", "").strip()
+SHEET_TAB = os.getenv("GOOGLE_SHEETS_TAB", "Sheet1").strip()
 
 sheets_api = None
 
-if SERVICE_JSON:
+def load_service_info():
+    # 1) Prefer JSON from env (Render style)
+    if SERVICE_JSON:
+        return json.loads(SERVICE_JSON)
+
+    # 2) Fallback to file (Local dev style)
+    if SERVICE_FILE and os.path.exists(SERVICE_FILE):
+        with open(SERVICE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    return None
+
+if True:
+    service_info = None
     try:
-        service_info = json.loads(SERVICE_JSON)
-        print("Sheets target ID:", GOOGLE_SHEETS_ID)
-        print("Service account email:", service_info.get("client_email"))
-
-        SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_info(service_info, scopes=SCOPES)
-        sheets_service = build("sheets", "v4", credentials=creds)
-        sheets_api = sheets_service.spreadsheets()
-        print("Google Sheets initialized")
-
-        # TEMP: Confirm access to the spreadsheet ID (helps debug 404 issues)
-        try:
-            meta = sheets_api.get(spreadsheetId=GOOGLE_SHEETS_ID).execute()
-            print("Sheets access OK. Title:", meta.get("properties", {}).get("title"))
-        except Exception as e:
-            print("Sheets access TEST FAILED:", repr(e))
-
+        service_info = load_service_info()
     except Exception as e:
-        print("Google Sheets init failed:", repr(e))
-else:
-    print("SERVICE_ACCOUNT_JSON not set — Sheets disabled")
+        print("Service account load failed:", repr(e))
+        service_info = None
+
+    if service_info and GOOGLE_SHEETS_ID:
+        try:
+            print("Sheets target ID:", GOOGLE_SHEETS_ID)
+            print("Service account email:", service_info.get("client_email"))
+            print("Sheets tab:", SHEET_TAB)
+
+            SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+            creds = Credentials.from_service_account_info(service_info, scopes=SCOPES)
+            sheets_service = build("sheets", "v4", credentials=creds)
+            sheets_api = sheets_service.spreadsheets()
+            print("Google Sheets initialized")
+
+            # TEMP: Confirm access to the spreadsheet ID (helps debug 404 issues)
+            try:
+                meta = sheets_api.get(spreadsheetId=GOOGLE_SHEETS_ID).execute()
+                print("Sheets access OK. Title:", meta.get("properties", {}).get("title"))
+            except Exception as e:
+                print("Sheets access TEST FAILED:", repr(e))
+
+        except Exception as e:
+            print("Google Sheets init failed:", repr(e))
+    else:
+        if not GOOGLE_SHEETS_ID:
+            print("GOOGLE_SHEETS_ID not set — Sheets disabled")
+        else:
+            print("Service account not set — Sheets disabled (set SERVICE_ACCOUNT_JSON or SERVICE_ACCOUNT_FILE)")
 
 # -------------------------------------------------
 # Environment variables
 # -------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
-ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "")
+ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "").strip()
 CLINIC_NAME = os.getenv("CLINIC_NAME", "PrimeCare Medical Centre")
 
 # -------------------------------------------------
@@ -74,81 +104,49 @@ else:
     print("Warning: OPENAI_API_KEY not set — AI replies disabled")
 
 # -------------------------------------------------
-# Database (SQLite local → PostgreSQL on Render)
+# Database (PostgreSQL ONLY)  ✅ Step 2: SQLite removed
 # -------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")
-LOCAL_DB = "clinic_local.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 def db_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set. This app now requires Postgres (SQLite removed).")
     # Helpful debug so you always know what's being used
-    if DATABASE_URL:
-        print("DB: USING POSTGRESQL")
-        return psycopg2.connect(DATABASE_URL)
-    print("DB: USING SQLITE:", os.path.abspath(LOCAL_DB))
-    return sqlite3.connect(LOCAL_DB)
+    print("DB: USING POSTGRESQL")
+    return psycopg2.connect(DATABASE_URL)
 
 def init_db():
     conn = db_conn()
     c = conn.cursor()
 
-    if DATABASE_URL:
-        # PostgreSQL
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id SERIAL PRIMARY KEY,
-                user_number TEXT,
-                role TEXT,
-                content TEXT,
-                created_at TIMESTAMP
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS conversations (
-                user_number TEXT PRIMARY KEY,
-                context TEXT
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS appointments (
-                id SERIAL PRIMARY KEY,
-                user_number TEXT,
-                name TEXT,
-                date TEXT,
-                time TEXT,
-                status TEXT,
-                source TEXT,
-                created_at TIMESTAMP
-            )
-        """)
-    else:
-        # SQLite
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_number TEXT,
-                role TEXT,
-                content TEXT,
-                created_at TEXT
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS conversations (
-                user_number TEXT PRIMARY KEY,
-                context TEXT
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS appointments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_number TEXT,
-                name TEXT,
-                date TEXT,
-                time TEXT,
-                status TEXT,
-                source TEXT,
-                created_at TEXT
-            )
-        """)
+    # PostgreSQL tables (same schema you had)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            user_number TEXT,
+            role TEXT,
+            content TEXT,
+            created_at TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            user_number TEXT PRIMARY KEY,
+            context TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS appointments (
+            id SERIAL PRIMARY KEY,
+            user_number TEXT,
+            name TEXT,
+            date TEXT,
+            time TEXT,
+            status TEXT,
+            source TEXT,
+            created_at TIMESTAMP
+        )
+    """)
 
     conn.commit()
     conn.close()
@@ -162,24 +160,20 @@ init_db()
 def save_message(user, role, msg):
     conn = db_conn()
     c = conn.cursor()
-    q = (
-        "INSERT INTO messages (user_number, role, content, created_at) VALUES (%s,%s,%s,%s)"
-        if DATABASE_URL else
-        "INSERT INTO messages (user_number, role, content, created_at) VALUES (?,?,?,?)"
+    c.execute(
+        "INSERT INTO messages (user_number, role, content, created_at) VALUES (%s,%s,%s,%s)",
+        (user, role, msg, datetime.datetime.utcnow())
     )
-    c.execute(q, (user, role, msg, datetime.datetime.utcnow()))
     conn.commit()
     conn.close()
 
 def load_recent_messages(user, limit=12):
     conn = db_conn()
     c = conn.cursor()
-    q = (
-        f"SELECT role, content FROM messages WHERE user_number=%s ORDER BY id DESC LIMIT {limit}"
-        if DATABASE_URL else
-        f"SELECT role, content FROM messages WHERE user_number=? ORDER BY id DESC LIMIT {limit}"
+    c.execute(
+        f"SELECT role, content FROM messages WHERE user_number=%s ORDER BY id DESC LIMIT {limit}",
+        (user,)
     )
-    c.execute(q, (user,))
     rows = c.fetchall()
     conn.close()
     rows.reverse()
@@ -188,12 +182,7 @@ def load_recent_messages(user, limit=12):
 def get_context(user):
     conn = db_conn()
     c = conn.cursor()
-    q = (
-        "SELECT context FROM conversations WHERE user_number=%s"
-        if DATABASE_URL else
-        "SELECT context FROM conversations WHERE user_number=?"
-    )
-    c.execute(q, (user,))
+    c.execute("SELECT context FROM conversations WHERE user_number=%s", (user,))
     r = c.fetchone()
     conn.close()
     return r[0] if r else ""
@@ -201,18 +190,12 @@ def get_context(user):
 def set_context(user, ctx):
     conn = db_conn()
     c = conn.cursor()
-    if DATABASE_URL:
-        c.execute("""
-            INSERT INTO conversations (user_number, context)
-            VALUES (%s,%s)
-            ON CONFLICT (user_number)
-            DO UPDATE SET context=EXCLUDED.context
-        """, (user, ctx))
-    else:
-        c.execute("""
-            INSERT OR REPLACE INTO conversations (user_number, context)
-            VALUES (?,?)
-        """, (user, ctx))
+    c.execute("""
+        INSERT INTO conversations (user_number, context)
+        VALUES (%s,%s)
+        ON CONFLICT (user_number)
+        DO UPDATE SET context=EXCLUDED.context
+    """, (user, ctx))
     conn.commit()
     conn.close()
 
@@ -221,16 +204,15 @@ def clear_context(user):
 
 # -------------------------------------------------
 # Double booking check (DB + Google Sheets)
+# ✅ Step 1: Fix sheet column check (DATE is A, TIME is C)
 # -------------------------------------------------
 def check_double_booking(date, time):
     conn = db_conn()
     c = conn.cursor()
-    q = (
-        "SELECT id FROM appointments WHERE date=%s AND time=%s AND status='Booked'"
-        if DATABASE_URL else
-        "SELECT id FROM appointments WHERE date=? AND time=? AND status='Booked'"
+    c.execute(
+        "SELECT id FROM appointments WHERE date=%s AND time=%s AND status='Booked'",
+        (date, time)
     )
-    c.execute(q, (date, time))
     exists = c.fetchone()
     conn.close()
 
@@ -241,13 +223,17 @@ def check_double_booking(date, time):
         return False
 
     try:
+        # Read A:K because your sheet has DATE in A and TIME in C
         res = sheets_api.values().get(
             spreadsheetId=GOOGLE_SHEETS_ID,
-            range="Sheet1!A2:B"
+            range=f"{SHEET_TAB}!A2:K"
         ).execute()
+
         for row in res.get("values", []):
-            if len(row) >= 2 and row[0] == date and row[1] == time:
+            # A -> row[0] = date, C -> row[2] = time (because B is blank)
+            if len(row) >= 3 and row[0] == date and row[2] == time:
                 return True
+
     except Exception as e:
         print("Sheets check error:", repr(e))
 
@@ -324,24 +310,23 @@ def ai_reply(user, msg):
 # Save appointment
 # -------------------------------------------------
 def save_appointment_local(user, name, date, time):
+    # Kept function name so your existing logic stays intact,
+    # but it now saves to Postgres only (SQLite removed).
     conn = db_conn()
     c = conn.cursor()
-    q = (
-        "INSERT INTO appointments (user_number,name,date,time,status,source,created_at) VALUES (%s,%s,%s,%s,'Booked','WhatsApp',%s)"
-        if DATABASE_URL else
-        "INSERT INTO appointments (user_number,name,date,time,status,source,created_at) VALUES (?,?,?,?, 'Booked','WhatsApp',?)"
+    c.execute(
+        "INSERT INTO appointments (user_number,name,date,time,status,source,created_at) VALUES (%s,%s,%s,%s,'Booked','WhatsApp',%s)",
+        (user, name, date, time, datetime.datetime.utcnow())
     )
-    c.execute(q, (user, name, date, time, datetime.datetime.utcnow()))
     conn.commit()
-    appt_id = c.lastrowid if not DATABASE_URL else None
     conn.close()
-    return appt_id
+    return None
 
 def append_to_sheet(date, time, name, phone):
     # If Sheets wasn't initialized, skip but LOG why
     if not sheets_api:
         print("Sheets append skipped: sheets_api is None (Sheets not initialized).")
-        print("Check SERVICE_ACCOUNT_JSON and GOOGLE_SHEETS_ID env vars.")
+        print("Check SERVICE_ACCOUNT_JSON or SERVICE_ACCOUNT_FILE and GOOGLE_SHEETS_ID env vars.")
         return
 
     if not GOOGLE_SHEETS_ID:
@@ -349,11 +334,12 @@ def append_to_sheet(date, time, name, phone):
         return
 
     try:
-        # A:K layout (matches your current sheet spacing)
+        # ✅ Step 1: Safe append range and USER_ENTERED
+        # Your headers are spaced: A DATE, C TIME, E NAME, G PHONE, I STATUS, K SOURCE
         sheets_api.values().append(
             spreadsheetId=GOOGLE_SHEETS_ID,
-            range="Sheet1!A1",
-            valueInputOption="RAW",
+            range=f"{SHEET_TAB}!A:K",
+            valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": [[
                 date, "", time, "", name, "", phone, "", "Booked", "", "WhatsApp"
@@ -506,3 +492,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting {CLINIC_NAME} bot on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
+

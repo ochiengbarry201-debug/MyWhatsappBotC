@@ -47,6 +47,11 @@ def load_service_info():
 
     return None
 
+# ✅ FIX #1: Safe A1 range builder (quotes tab names with dots/spaces/parentheses)
+def a1(tab: str, cells: str) -> str:
+    safe = tab.replace("'", "''")  # escape single quotes for A1
+    return f"'{safe}'!{cells}"
+
 if True:
     service_info = None
     try:
@@ -205,6 +210,7 @@ def clear_context(user):
 # -------------------------------------------------
 # Double booking check (DB + Google Sheets)
 # ✅ Step 1: Fix sheet column check (DATE is A, TIME is C)
+# ✅ FIX #2: Quote tab name safely in A1 notation
 # -------------------------------------------------
 def check_double_booking(date, time):
     conn = db_conn()
@@ -226,7 +232,7 @@ def check_double_booking(date, time):
         # Read A:K because your sheet has DATE in A and TIME in C
         res = sheets_api.values().get(
             spreadsheetId=GOOGLE_SHEETS_ID,
-            range=f"{SHEET_TAB}!A2:K"
+            range=a1(SHEET_TAB, "A2:K")
         ).execute()
 
         for row in res.get("values", []):
@@ -322,6 +328,18 @@ def save_appointment_local(user, name, date, time):
     conn.close()
     return None
 
+# ✅ FIX #3: Mapping append to lock values into A,C,E,G,I,K permanently
+def col_to_index(col: str) -> int:
+    col = col.strip().upper()
+    return ord(col) - ord("A")  # A-Z is enough for A..K
+
+def build_row_from_map(column_map: dict, data: dict) -> list:
+    max_index = max(col_to_index(c) for c in column_map.values())
+    row = [""] * (max_index + 1)
+    for field, col in column_map.items():
+        row[col_to_index(col)] = data.get(field, "")
+    return row
+
 def append_to_sheet(date, time, name, phone):
     # If Sheets wasn't initialized, skip but LOG why
     if not sheets_api:
@@ -334,16 +352,37 @@ def append_to_sheet(date, time, name, phone):
         return
 
     try:
-        # ✅ Step 1: Safe append range and USER_ENTERED
         # Your headers are spaced: A DATE, C TIME, E NAME, G PHONE, I STATUS, K SOURCE
+        column_map = {
+            "date": "A",
+            "time": "C",
+            "name": "E",
+            "phone": "G",
+            "status": "I",
+            "source": "K",
+        }
+
+        data = {
+            "date": date,
+            "time": time,
+            "name": name,
+            "phone": phone,
+            "status": "Booked",
+            "source": "WhatsApp",
+        }
+
+        row_values = build_row_from_map(column_map, data)
+
+        # Debug: prove exactly what A1 range and row we're writing
+        print("APPEND RANGE:", a1(SHEET_TAB, "A:K"))
+        print("APPEND VALUES:", row_values)
+
         sheets_api.values().append(
             spreadsheetId=GOOGLE_SHEETS_ID,
-            range=f"{SHEET_TAB}!A:K",
+            range=a1(SHEET_TAB, "A:K"),
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": [[
-                date, "", time, "", name, "", phone, "", "Booked", "", "WhatsApp"
-            ]]}
+            body={"values": [row_values]}
         ).execute()
         print("Sheets append OK:", date, time, name, phone)
     except Exception as e:
@@ -492,4 +531,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting {CLINIC_NAME} bot on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
-

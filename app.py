@@ -52,6 +52,78 @@ def a1(tab: str, cells: str) -> str:
     safe = tab.replace("'", "''")  # escape single quotes for A1
     return f"'{safe}'!{cells}"
 
+# ✅ PATCH: Header-driven mapping so we never drift to K–U again
+def _norm_header(s: str) -> str:
+    # normalize: lowercase, trim, collapse spaces
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+def _index_to_col(idx: int) -> str:
+    # 0 -> A, 25 -> Z, 26 -> AA ...
+    idx += 1
+    out = ""
+    while idx > 0:
+        idx, r = divmod(idx - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+def get_sheet_header_map():
+    """
+    Reads row 1 (A1:Z1) and returns column letters for the fields we need:
+    date, time, name, phone, status, source.
+    This adapts even if your headers shift to K, M, O... etc.
+    """
+    if not sheets_api:
+        return None
+
+    try:
+        res = sheets_api.values().get(
+            spreadsheetId=GOOGLE_SHEETS_ID,
+            range=a1(SHEET_TAB, "A1:Z1")
+        ).execute()
+        header_row = (res.get("values") or [[]])[0]
+
+        # Map normalized header text -> index
+        header_index = {}
+        for i, cell in enumerate(header_row):
+            key = _norm_header(cell)
+            if key:
+                header_index[key] = i
+
+        # Adjust these variants to match your sheet header words
+        wanted = {
+            "date": ["date", "appointment date", "booking date"],
+            "time": ["time", "appointment time", "booking time"],
+            "name": ["name", "patient name", "full name"],
+            "phone": ["phone", "phone number", "mobile", "number"],
+            "status": ["status"],
+            "source": ["source"],
+        }
+
+        out = {}
+        for field, variants in wanted.items():
+            found_idx = None
+            for v in variants:
+                vkey = _norm_header(v)
+                if vkey in header_index:
+                    found_idx = header_index[vkey]
+                    break
+            if found_idx is not None:
+                out[field] = _index_to_col(found_idx)
+
+        return out
+    except Exception as e:
+        print("Header map read failed:", repr(e))
+        return None
+
+def _col_to_idx(col: str) -> int:
+    # A->0, Z->25, AA->26...
+    col = (col or "").strip().upper()
+    n = 0
+    for ch in col:
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - 64)
+    return n - 1
+
 if True:
     service_info = None
     try:
@@ -211,6 +283,7 @@ def clear_context(user):
 # Double booking check (DB + Google Sheets)
 # ✅ Step 1: Fix sheet column check (DATE is A, TIME is C)
 # ✅ FIX #2: Quote tab name safely in A1 notation
+# ✅ PATCH: Use header map if available (prevents wrong column check)
 # -------------------------------------------------
 def check_double_booking(date, time):
     conn = db_conn()
@@ -229,14 +302,33 @@ def check_double_booking(date, time):
         return False
 
     try:
-        # Read A:K because your sheet has DATE in A and TIME in C
+        header_map = get_sheet_header_map()
+
+        # If header map works, use it (bulletproof)
+        if header_map and "date" in header_map and "time" in header_map:
+            date_i = _col_to_idx(header_map["date"])
+            time_i = _col_to_idx(header_map["time"])
+
+            res = sheets_api.values().get(
+                spreadsheetId=GOOGLE_SHEETS_ID,
+                range=a1(SHEET_TAB, "A2:Z")
+            ).execute()
+
+            for row in res.get("values", []):
+                d = row[date_i] if len(row) > date_i else ""
+                t = row[time_i] if len(row) > time_i else ""
+                if d == date and t == time:
+                    return True
+
+            return False
+
+        # Fallback to your old assumption (A=date, C=time)
         res = sheets_api.values().get(
             spreadsheetId=GOOGLE_SHEETS_ID,
             range=a1(SHEET_TAB, "A2:K")
         ).execute()
 
         for row in res.get("values", []):
-            # A -> row[0] = date, C -> row[2] = time (because B is blank)
             if len(row) >= 3 and row[0] == date and row[2] == time:
                 return True
 
@@ -352,7 +444,49 @@ def append_to_sheet(date, time, name, phone):
         return
 
     try:
-        # Your headers are spaced: A DATE, C TIME, E NAME, G PHONE, I STATUS, K SOURCE
+        header_map = get_sheet_header_map()
+
+        # If header map works, write EXACTLY under the real headers (bulletproof)
+        if header_map:
+            required = ["date", "time", "name", "phone", "status", "source"]
+            missing = [k for k in required if k not in header_map]
+            if missing:
+                print("Sheets append FAILED: Missing headers in row 1:", missing)
+                print("Detected header map:", header_map)
+                # fall back below
+            else:
+                date_i = _col_to_idx(header_map["date"])
+                time_i = _col_to_idx(header_map["time"])
+                name_i = _col_to_idx(header_map["name"])
+                phone_i = _col_to_idx(header_map["phone"])
+                status_i = _col_to_idx(header_map["status"])
+                source_i = _col_to_idx(header_map["source"])
+
+                max_i = max(date_i, time_i, name_i, phone_i, status_i, source_i)
+                row_values = [""] * (max_i + 1)
+
+                row_values[date_i] = date
+                row_values[time_i] = time
+                row_values[name_i] = name
+                row_values[phone_i] = phone
+                row_values[status_i] = "Booked"
+                row_values[source_i] = "WhatsApp"
+
+                print("APPEND HEADER MAP:", header_map)
+                print("APPEND RANGE:", a1(SHEET_TAB, "A:Z"))
+                print("APPEND VALUES:", row_values)
+
+                sheets_api.values().append(
+                    spreadsheetId=GOOGLE_SHEETS_ID,
+                    range=a1(SHEET_TAB, "A:Z"),
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": [row_values]}
+                ).execute()
+                print("Sheets append OK:", date, time, name, phone)
+                return
+
+        # Fallback to your old fixed spacing (A,C,E,G,I,K)
         column_map = {
             "date": "A",
             "time": "C",
@@ -373,7 +507,6 @@ def append_to_sheet(date, time, name, phone):
 
         row_values = build_row_from_map(column_map, data)
 
-        # Debug: prove exactly what A1 range and row we're writing
         print("APPEND RANGE:", a1(SHEET_TAB, "A:K"))
         print("APPEND VALUES:", row_values)
 
@@ -385,6 +518,7 @@ def append_to_sheet(date, time, name, phone):
             body={"values": [row_values]}
         ).execute()
         print("Sheets append OK:", date, time, name, phone)
+
     except Exception as e:
         print("Sheets append FAILED:", repr(e))
 

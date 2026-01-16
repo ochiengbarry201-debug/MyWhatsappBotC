@@ -207,13 +207,17 @@ def init_db():
             created_at TIMESTAMP
         )
     """)
+
+    # ✅ PATCH: conversations uses composite primary key for multi-clinic safety
     c.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
-            user_number TEXT PRIMARY KEY,
             clinic_id uuid,
-            context TEXT
+            user_number TEXT,
+            context TEXT,
+            PRIMARY KEY (clinic_id, user_number)
         )
     """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS appointments (
             id SERIAL PRIMARY KEY,
@@ -259,28 +263,29 @@ def load_recent_messages(clinic_id, user, limit=12):
     rows.reverse()
     return [{"role": r, "content": t} for r, t in rows]
 
-def get_context(user):
+# ✅ PATCH: clinic-aware context functions
+def get_context(clinic_id, user):
     conn = db_conn()
     c = conn.cursor()
-    c.execute("SELECT context FROM conversations WHERE user_number=%s", (user,))
+    c.execute("SELECT context FROM conversations WHERE clinic_id=%s AND user_number=%s", (clinic_id, user))
     r = c.fetchone()
     conn.close()
     return r[0] if r else ""
 
-def set_context(user, ctx):
+def set_context(clinic_id, user, ctx):
     conn = db_conn()
     c = conn.cursor()
     c.execute("""
-        INSERT INTO conversations (user_number, context)
-        VALUES (%s,%s)
-        ON CONFLICT (user_number)
+        INSERT INTO conversations (clinic_id, user_number, context)
+        VALUES (%s,%s,%s)
+        ON CONFLICT (clinic_id, user_number)
         DO UPDATE SET context=EXCLUDED.context
-    """, (user, ctx))
+    """, (clinic_id, user, ctx))
     conn.commit()
     conn.close()
 
-def clear_context(user):
-    set_context(user, "")
+def clear_context(clinic_id, user):
+    set_context(clinic_id, user, "")
 
 # -------------------------------------------------
 # ✅ PATCH: Clinic resolver (multi-clinic routing foundation)
@@ -576,10 +581,10 @@ def whatsapp_webhook():
         return Response(str(resp), mimetype="application/xml")
 
     save_message(clinic_id, user, "user", incoming)
-    context = get_context(user)
+    context = get_context(clinic_id, user)
 
     if incoming.lower() == "reset":
-        clear_context(user)
+        clear_context(clinic_id, user)
         reply = "Session reset. You can start again."
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
@@ -588,7 +593,7 @@ def whatsapp_webhook():
 
     # Booking flow
     if context == "awaiting_name":
-        set_context(user, f"name:{incoming}")
+        set_context(clinic_id, user, f"name:{incoming}")
         reply = "What date would you like? (YYYY-MM-DD)"
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
@@ -598,7 +603,7 @@ def whatsapp_webhook():
     if context.startswith("name:") and "|date:" not in context:
         if looks_like_date(incoming):
             name = context.split("name:", 1)[1]
-            set_context(user, f"name:{name}|date:{incoming}")
+            set_context(clinic_id, user, f"name:{name}|date:{incoming}")
             reply = "What time would you prefer? (HH:MM) e.g. 14:00"
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
@@ -624,7 +629,7 @@ def whatsapp_webhook():
                 print("TWIML OUT:", str(resp))
                 return Response(str(resp), mimetype="application/xml")
 
-            set_context(user, f"name:{name}|date:{date}|time:{incoming}")
+            set_context(clinic_id, user, f"name:{name}|date:{date}|time:{incoming}")
             reply = f"Confirm appointment on {date} at {incoming}? (yes/no)"
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
@@ -646,7 +651,7 @@ def whatsapp_webhook():
 
             save_appointment_local(user, name, date, time)
             append_to_sheet(date, time, name, user)
-            clear_context(user)
+            clear_context(clinic_id, user)
 
             reply = f"✅ Appointment confirmed for {date} at {time}"
             msg.body(reply)
@@ -655,7 +660,7 @@ def whatsapp_webhook():
             return Response(str(resp), mimetype="application/xml")
 
         if incoming.lower() in ["no", "n"]:
-            clear_context(user)
+            clear_context(clinic_id, user)
             reply = "No problem — booking cancelled. Type 'book' to start again."
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
@@ -670,7 +675,7 @@ def whatsapp_webhook():
 
     # If user is trying to book, start the real booking flow
     if is_booking_intent(incoming):
-        set_context(user, "awaiting_name")
+        set_context(clinic_id, user, "awaiting_name")
         reply = "Sure. What's your full name?"
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
@@ -700,5 +705,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting {CLINIC_NAME} bot on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
-
 

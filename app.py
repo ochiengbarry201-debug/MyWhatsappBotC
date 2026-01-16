@@ -196,10 +196,11 @@ def init_db():
     conn = db_conn()
     c = conn.cursor()
 
-    # PostgreSQL tables (same schema you had)
+    # PostgreSQL tables (same schema you had) + clinic_id columns for future safety
     c.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id SERIAL PRIMARY KEY,
+            clinic_id uuid,
             user_number TEXT,
             role TEXT,
             content TEXT,
@@ -209,12 +210,14 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             user_number TEXT PRIMARY KEY,
+            clinic_id uuid,
             context TEXT
         )
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS appointments (
             id SERIAL PRIMARY KEY,
+            clinic_id uuid,
             user_number TEXT,
             name TEXT,
             date TEXT,
@@ -234,22 +237,22 @@ init_db()
 # -------------------------------------------------
 # DB Helpers
 # -------------------------------------------------
-def save_message(user, role, msg):
+def save_message(clinic_id, user, role, msg):
     conn = db_conn()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO messages (user_number, role, content, created_at) VALUES (%s,%s,%s,%s)",
-        (user, role, msg, datetime.datetime.utcnow())
+        "INSERT INTO messages (clinic_id, user_number, role, content, created_at) VALUES (%s,%s,%s,%s,%s)",
+        (clinic_id, user, role, msg, datetime.datetime.utcnow())
     )
     conn.commit()
     conn.close()
 
-def load_recent_messages(user, limit=12):
+def load_recent_messages(clinic_id, user, limit=12):
     conn = db_conn()
     c = conn.cursor()
     c.execute(
-        f"SELECT role, content FROM messages WHERE user_number=%s ORDER BY id DESC LIMIT {limit}",
-        (user,)
+        f"SELECT role, content FROM messages WHERE clinic_id=%s AND user_number=%s ORDER BY id DESC LIMIT {limit}",
+        (clinic_id, user)
     )
     rows = c.fetchall()
     conn.close()
@@ -407,12 +410,12 @@ CRITICAL RULES:
 - If a user wants an appointment, tell them to type "book" to start the booking.
 """
 
-def ai_reply(user, msg):
+def ai_reply(clinic_id, user, msg):
     if not openai_client:
         return f"This is {CLINIC_NAME}. Say 'book' to make an appointment."
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages += load_recent_messages(user)
+    messages += load_recent_messages(clinic_id, user)
     messages.append({"role": "user", "content": msg})
 
     try:
@@ -572,14 +575,14 @@ def whatsapp_webhook():
         msg.body("This WhatsApp line is not linked to a clinic yet.")
         return Response(str(resp), mimetype="application/xml")
 
-    save_message(user, "user", incoming)
+    save_message(clinic_id, user, "user", incoming)
     context = get_context(user)
 
     if incoming.lower() == "reset":
         clear_context(user)
         reply = "Session reset. You can start again."
         msg.body(reply)
-        save_message(user, "assistant", reply)
+        save_message(clinic_id, user, "assistant", reply)
         print("TWIML OUT:", str(resp))
         return Response(str(resp), mimetype="application/xml")
 
@@ -588,7 +591,7 @@ def whatsapp_webhook():
         set_context(user, f"name:{incoming}")
         reply = "What date would you like? (YYYY-MM-DD)"
         msg.body(reply)
-        save_message(user, "assistant", reply)
+        save_message(clinic_id, user, "assistant", reply)
         print("TWIML OUT:", str(resp))
         return Response(str(resp), mimetype="application/xml")
 
@@ -598,13 +601,13 @@ def whatsapp_webhook():
             set_context(user, f"name:{name}|date:{incoming}")
             reply = "What time would you prefer? (HH:MM) e.g. 14:00"
             msg.body(reply)
-            save_message(user, "assistant", reply)
+            save_message(clinic_id, user, "assistant", reply)
             print("TWIML OUT:", str(resp))
             return Response(str(resp), mimetype="application/xml")
         else:
             reply = "Please type the date like 2026-01-15 (YYYY-MM-DD)."
             msg.body(reply)
-            save_message(user, "assistant", reply)
+            save_message(clinic_id, user, "assistant", reply)
             print("TWIML OUT:", str(resp))
             return Response(str(resp), mimetype="application/xml")
 
@@ -617,20 +620,20 @@ def whatsapp_webhook():
             if check_double_booking(date, incoming):
                 reply = "That slot is already booked. Choose another time."
                 msg.body(reply)
-                save_message(user, "assistant", reply)
+                save_message(clinic_id, user, "assistant", reply)
                 print("TWIML OUT:", str(resp))
                 return Response(str(resp), mimetype="application/xml")
 
             set_context(user, f"name:{name}|date:{date}|time:{incoming}")
             reply = f"Confirm appointment on {date} at {incoming}? (yes/no)"
             msg.body(reply)
-            save_message(user, "assistant", reply)
+            save_message(clinic_id, user, "assistant", reply)
             print("TWIML OUT:", str(resp))
             return Response(str(resp), mimetype="application/xml")
         else:
             reply = "Please type the time like 09:30 (HH:MM) e.g. 14:00."
             msg.body(reply)
-            save_message(user, "assistant", reply)
+            save_message(clinic_id, user, "assistant", reply)
             print("TWIML OUT:", str(resp))
             return Response(str(resp), mimetype="application/xml")
 
@@ -647,7 +650,7 @@ def whatsapp_webhook():
 
             reply = f"✅ Appointment confirmed for {date} at {time}"
             msg.body(reply)
-            save_message(user, "assistant", reply)
+            save_message(clinic_id, user, "assistant", reply)
             print("TWIML OUT:", str(resp))
             return Response(str(resp), mimetype="application/xml")
 
@@ -655,13 +658,13 @@ def whatsapp_webhook():
             clear_context(user)
             reply = "No problem — booking cancelled. Type 'book' to start again."
             msg.body(reply)
-            save_message(user, "assistant", reply)
+            save_message(clinic_id, user, "assistant", reply)
             print("TWIML OUT:", str(resp))
             return Response(str(resp), mimetype="application/xml")
 
         reply = "Please reply with 'yes' to confirm or 'no' to cancel."
         msg.body(reply)
-        save_message(user, "assistant", reply)
+        save_message(clinic_id, user, "assistant", reply)
         print("TWIML OUT:", str(resp))
         return Response(str(resp), mimetype="application/xml")
 
@@ -670,7 +673,7 @@ def whatsapp_webhook():
         set_context(user, "awaiting_name")
         reply = "Sure. What's your full name?"
         msg.body(reply)
-        save_message(user, "assistant", reply)
+        save_message(clinic_id, user, "assistant", reply)
         print("TWIML OUT:", str(resp))
         return Response(str(resp), mimetype="application/xml")
 
@@ -679,14 +682,14 @@ def whatsapp_webhook():
     if any(w in incoming.lower() for w in maybe_booking_words):
         reply = "If you'd like to book an appointment, please type 'book'."
         msg.body(reply)
-        save_message(user, "assistant", reply)
+        save_message(clinic_id, user, "assistant", reply)
         print("TWIML OUT:", str(resp))
         return Response(str(resp), mimetype="application/xml")
 
     # Otherwise, use AI for general replies
-    reply = ai_reply(user, incoming)
+    reply = ai_reply(clinic_id, user, incoming)
     msg.body(reply)
-    save_message(user, "assistant", reply)
+    save_message(clinic_id, user, "assistant", reply)
     print("TWIML OUT:", str(resp))
     return Response(str(resp), mimetype="application/xml")
 
@@ -697,4 +700,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting {CLINIC_NAME} bot on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
+
 

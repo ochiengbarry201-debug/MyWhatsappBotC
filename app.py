@@ -208,6 +208,9 @@ def init_db():
         )
     """)
 
+    # ✅ Add-on: ensure twilio_sid column exists (you already added it via SQL, this is just safety)
+    c.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS twilio_sid TEXT")
+
     # ✅ PATCH: conversations uses composite primary key for multi-clinic safety
     c.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
@@ -241,15 +244,31 @@ init_db()
 # -------------------------------------------------
 # DB Helpers
 # -------------------------------------------------
-def save_message(clinic_id, user, role, msg):
+def save_message(clinic_id, user, role, msg, twilio_sid=None):
     conn = db_conn()
     c = conn.cursor()
+    # ✅ Add-on: store twilio_sid for inbound messages; ON CONFLICT DO NOTHING prevents duplicate sid inserts
     c.execute(
-        "INSERT INTO messages (clinic_id, user_number, role, content, created_at) VALUES (%s,%s,%s,%s,%s)",
-        (clinic_id, user, role, msg, datetime.datetime.utcnow())
+        """
+        INSERT INTO messages (clinic_id, user_number, role, content, created_at, twilio_sid)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        ON CONFLICT DO NOTHING
+        """,
+        (clinic_id, user, role, msg, datetime.datetime.utcnow(), twilio_sid)
     )
     conn.commit()
     conn.close()
+
+# ✅ Add-on: idempotency check
+def already_processed_twilio_sid(twilio_sid: str) -> bool:
+    if not twilio_sid:
+        return False
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM messages WHERE twilio_sid=%s LIMIT 1", (twilio_sid,))
+    exists = c.fetchone() is not None
+    conn.close()
+    return exists
 
 def load_recent_messages(clinic_id, user, limit=12):
     conn = db_conn()
@@ -313,14 +332,14 @@ def resolve_clinic_id(to_number: str):
 
 # -------------------------------------------------
 # Double booking check (DB + Google Sheets)
-# ✅ PATCH: fallback updated to A–F (DATE=A, TIME=B)
+# ✅ Add-on: clinic-aware DB check (important now)
 # -------------------------------------------------
-def check_double_booking(date, time):
+def check_double_booking(clinic_id, date, time):
     conn = db_conn()
     c = conn.cursor()
     c.execute(
-        "SELECT id FROM appointments WHERE date=%s AND time=%s AND status='Booked'",
-        (date, time)
+        "SELECT id FROM appointments WHERE clinic_id=%s AND date=%s AND time=%s AND status='Booked'",
+        (clinic_id, date, time)
     )
     exists = c.fetchone()
     conn.close()
@@ -435,16 +454,14 @@ def ai_reply(clinic_id, user, msg):
         return "Sorry, something went wrong."
 
 # -------------------------------------------------
-# Save appointment
+# Save appointment (clinic-aware insert; protected by your unique index)
 # -------------------------------------------------
-def save_appointment_local(user, name, date, time):
-    # Kept function name so your existing logic stays intact,
-    # but it now saves to Postgres only (SQLite removed).
+def save_appointment_local(clinic_id, user, name, date, time):
     conn = db_conn()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO appointments (user_number,name,date,time,status,source,created_at) VALUES (%s,%s,%s,%s,'Booked','WhatsApp',%s)",
-        (user, name, date, time, datetime.datetime.utcnow())
+        "INSERT INTO appointments (clinic_id, user_number, name, date, time, status, source, created_at) VALUES (%s,%s,%s,%s,%s,'Booked','WhatsApp',%s)",
+        (clinic_id, user, name, date, time, datetime.datetime.utcnow())
     )
     conn.commit()
     conn.close()
@@ -517,7 +534,6 @@ def append_to_sheet(date, time, name, phone):
                 return
 
         # Fallback to clean A–F layout
-        # A=DATE, B=TIME, C=NAME, D=PHONE, E=STATUS, F=SOURCE
         column_map = {
             "date": "A",
             "time": "B",
@@ -571,8 +587,8 @@ def whatsapp_webhook():
     resp = MessagingResponse()
     msg = resp.message()
 
-    # ✅ PATCH: resolve clinic_id by Twilio To number (sandbox works too)
-    to_number = request.values.get("To", "").strip()  # e.g. whatsapp:+14155238886
+    # Resolve clinic_id by Twilio To number
+    to_number = request.values.get("To", "").strip()
     clinic_id = resolve_clinic_id(to_number)
     print("Resolved clinic_id:", clinic_id, "To:", to_number)
 
@@ -580,7 +596,15 @@ def whatsapp_webhook():
         msg.body("This WhatsApp line is not linked to a clinic yet.")
         return Response(str(resp), mimetype="application/xml")
 
-    save_message(clinic_id, user, "user", incoming)
+    # ✅ Idempotency: ignore Twilio retries
+    twilio_sid = (request.values.get("MessageSid") or "").strip()
+    if twilio_sid and already_processed_twilio_sid(twilio_sid):
+        msg.body("✅ Received.")
+        return Response(str(resp), mimetype="application/xml")
+
+    # Save inbound message with sid
+    save_message(clinic_id, user, "user", incoming, twilio_sid=twilio_sid)
+
     context = get_context(clinic_id, user)
 
     if incoming.lower() == "reset":
@@ -622,7 +646,7 @@ def whatsapp_webhook():
             name = parts[0].split("name:", 1)[1]
             date = parts[1].split("date:", 1)[1]
 
-            if check_double_booking(date, incoming):
+            if check_double_booking(clinic_id, date, incoming):
                 reply = "That slot is already booked. Choose another time."
                 msg.body(reply)
                 save_message(clinic_id, user, "assistant", reply)
@@ -649,7 +673,18 @@ def whatsapp_webhook():
             date = parts[1].split("date:", 1)[1]
             time = parts[2].split("time:", 1)[1]
 
-            save_appointment_local(user, name, date, time)
+            # ✅ DB-safe insert (protected by unique index). Catch race duplicates.
+            try:
+                save_appointment_local(clinic_id, user, name, date, time)
+            except psycopg2.Error as e:
+                # 23505 = unique_violation
+                if getattr(e, "pgcode", None) == "23505":
+                    reply = "That slot is already booked. Choose another time."
+                    msg.body(reply)
+                    save_message(clinic_id, user, "assistant", reply)
+                    return Response(str(resp), mimetype="application/xml")
+                raise
+
             append_to_sheet(date, time, name, user)
             clear_context(clinic_id, user)
 
@@ -705,4 +740,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting {CLINIC_NAME} bot on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
-

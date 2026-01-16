@@ -280,6 +280,30 @@ def clear_context(user):
     set_context(user, "")
 
 # -------------------------------------------------
+# ✅ PATCH: Clinic resolver (multi-clinic routing foundation)
+# -------------------------------------------------
+def resolve_clinic_id(to_number: str):
+    """
+    Looks up which clinic owns this Twilio 'To' number.
+    Requires channels table to be created and populated.
+    """
+    try:
+        conn = db_conn()
+        c = conn.cursor()
+        c.execute("""
+            select clinic_id
+            from channels
+            where provider='twilio' and to_number=%s and is_active=true
+            limit 1
+        """, (to_number,))
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        print("resolve_clinic_id FAILED:", repr(e))
+        return None
+
+# -------------------------------------------------
 # Double booking check (DB + Google Sheets)
 # ✅ PATCH: fallback updated to A–F (DATE=A, TIME=B)
 # -------------------------------------------------
@@ -539,6 +563,15 @@ def whatsapp_webhook():
     resp = MessagingResponse()
     msg = resp.message()
 
+    # ✅ PATCH: resolve clinic_id by Twilio To number (sandbox works too)
+    to_number = request.values.get("To", "").strip()  # e.g. whatsapp:+14155238886
+    clinic_id = resolve_clinic_id(to_number)
+    print("Resolved clinic_id:", clinic_id, "To:", to_number)
+
+    if not clinic_id:
+        msg.body("This WhatsApp line is not linked to a clinic yet.")
+        return Response(str(resp), mimetype="application/xml")
+
     save_message(user, "user", incoming)
     context = get_context(user)
 
@@ -664,3 +697,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting {CLINIC_NAME} bot on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
+

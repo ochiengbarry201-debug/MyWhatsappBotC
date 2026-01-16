@@ -167,6 +167,15 @@ TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238
 ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "").strip()
 CLINIC_NAME = os.getenv("CLINIC_NAME", "PrimeCare Medical Centre")
 
+def normalize_admin_number(s: str) -> str:
+    return (s or "").strip().replace("whatsapp:", "")
+
+def is_admin(user_number: str) -> bool:
+    # If not set, we don't allow admin commands (safer)
+    if not ADMIN_WHATSAPP:
+        return False
+    return normalize_admin_number(user_number) == normalize_admin_number(ADMIN_WHATSAPP)
+
 # -------------------------------------------------
 # OpenAI Client
 # -------------------------------------------------
@@ -181,14 +190,13 @@ else:
     print("Warning: OPENAI_API_KEY not set — AI replies disabled")
 
 # -------------------------------------------------
-# Database (PostgreSQL ONLY)  ✅ Step 2: SQLite removed
+# Database (PostgreSQL ONLY)
 # -------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 def db_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set. This app now requires Postgres (SQLite removed).")
-    # Helpful debug so you always know what's being used
     print("DB: USING POSTGRESQL")
     return psycopg2.connect(DATABASE_URL)
 
@@ -196,7 +204,6 @@ def init_db():
     conn = db_conn()
     c = conn.cursor()
 
-    # PostgreSQL tables (same schema you had) + clinic_id columns for future safety
     c.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id SERIAL PRIMARY KEY,
@@ -207,11 +214,8 @@ def init_db():
             created_at TIMESTAMP
         )
     """)
-
-    # ✅ Add-on: ensure twilio_sid column exists (you already added it via SQL, this is just safety)
     c.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS twilio_sid TEXT")
 
-    # ✅ PATCH: conversations uses composite primary key for multi-clinic safety
     c.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             clinic_id uuid,
@@ -235,6 +239,10 @@ def init_db():
         )
     """)
 
+    c.execute("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sheet_sync_status text DEFAULT 'pending'")
+    c.execute("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sheet_sync_error text")
+    c.execute("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sheet_synced_at timestamptz")
+
     conn.commit()
     conn.close()
     print("DB tables checked/created successfully")
@@ -247,7 +255,6 @@ init_db()
 def save_message(clinic_id, user, role, msg, twilio_sid=None):
     conn = db_conn()
     c = conn.cursor()
-    # ✅ Add-on: store twilio_sid for inbound messages; ON CONFLICT DO NOTHING prevents duplicate sid inserts
     c.execute(
         """
         INSERT INTO messages (clinic_id, user_number, role, content, created_at, twilio_sid)
@@ -259,7 +266,6 @@ def save_message(clinic_id, user, role, msg, twilio_sid=None):
     conn.commit()
     conn.close()
 
-# ✅ Add-on: idempotency check
 def already_processed_twilio_sid(twilio_sid: str) -> bool:
     if not twilio_sid:
         return False
@@ -282,7 +288,6 @@ def load_recent_messages(clinic_id, user, limit=12):
     rows.reverse()
     return [{"role": r, "content": t} for r, t in rows]
 
-# ✅ PATCH: clinic-aware context functions
 def get_context(clinic_id, user):
     conn = db_conn()
     c = conn.cursor()
@@ -306,14 +311,61 @@ def set_context(clinic_id, user, ctx):
 def clear_context(clinic_id, user):
     set_context(clinic_id, user, "")
 
+def update_sheet_sync_status(appointment_id, status, error=None):
+    try:
+        conn = db_conn()
+        c = conn.cursor()
+        if status == "synced":
+            c.execute(
+                """
+                UPDATE appointments
+                SET sheet_sync_status=%s,
+                    sheet_sync_error=NULL,
+                    sheet_synced_at=now()
+                WHERE id=%s
+                """,
+                (status, appointment_id)
+            )
+        else:
+            err = (error or "")[:800]
+            c.execute(
+                """
+                UPDATE appointments
+                SET sheet_sync_status=%s,
+                    sheet_sync_error=%s
+                WHERE id=%s
+                """,
+                (status, err, appointment_id)
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("update_sheet_sync_status FAILED:", repr(e))
+
+# ✅ Add-on: fetch unsynced appointments for retry
+def get_unsynced_appointments(clinic_id, limit=20):
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, user_number, name, date, time, sheet_sync_status
+        FROM appointments
+        WHERE clinic_id=%s
+          AND status='Booked'
+          AND sheet_sync_status IN ('failed','pending')
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (clinic_id, limit)
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 # -------------------------------------------------
-# ✅ PATCH: Clinic resolver (multi-clinic routing foundation)
+# Clinic resolver
 # -------------------------------------------------
 def resolve_clinic_id(to_number: str):
-    """
-    Looks up which clinic owns this Twilio 'To' number.
-    Requires channels table to be created and populated.
-    """
     try:
         conn = db_conn()
         c = conn.cursor()
@@ -332,7 +384,6 @@ def resolve_clinic_id(to_number: str):
 
 # -------------------------------------------------
 # Double booking check (DB + Google Sheets)
-# ✅ Add-on: clinic-aware DB check (important now)
 # -------------------------------------------------
 def check_double_booking(clinic_id, date, time):
     conn = db_conn()
@@ -353,7 +404,6 @@ def check_double_booking(clinic_id, date, time):
     try:
         header_map = get_sheet_header_map()
 
-        # If header map works, use it (bulletproof)
         if header_map and "date" in header_map and "time" in header_map:
             date_i = _col_to_idx(header_map["date"])
             time_i = _col_to_idx(header_map["time"])
@@ -371,7 +421,6 @@ def check_double_booking(clinic_id, date, time):
 
             return False
 
-        # Fallback to A–F assumption (A=date, B=time)
         res = sheets_api.values().get(
             spreadsheetId=GOOGLE_SHEETS_ID,
             range=a1(SHEET_TAB, "A2:F")
@@ -454,23 +503,30 @@ def ai_reply(clinic_id, user, msg):
         return "Sorry, something went wrong."
 
 # -------------------------------------------------
-# Save appointment (clinic-aware insert; protected by your unique index)
+# Save appointment (DB-first)
 # -------------------------------------------------
 def save_appointment_local(clinic_id, user, name, date, time):
     conn = db_conn()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO appointments (clinic_id, user_number, name, date, time, status, source, created_at) VALUES (%s,%s,%s,%s,%s,'Booked','WhatsApp',%s)",
+        """
+        INSERT INTO appointments (clinic_id, user_number, name, date, time, status, source, created_at, sheet_sync_status)
+        VALUES (%s,%s,%s,%s,%s,'Booked','WhatsApp',%s,'pending')
+        RETURNING id
+        """,
         (clinic_id, user, name, date, time, datetime.datetime.utcnow())
     )
+    appt_id = c.fetchone()[0]
     conn.commit()
     conn.close()
-    return None
+    return appt_id
 
-# ✅ FIX #3: Mapping append to lock values into A–F cleanly (DATE,TIME,NAME,PHONE,STATUS,SOURCE)
+# -------------------------------------------------
+# Sheets append (returns True/False)
+# -------------------------------------------------
 def col_to_index(col: str) -> int:
     col = col.strip().upper()
-    return ord(col) - ord("A")  # A-Z
+    return ord(col) - ord("A")
 
 def build_row_from_map(column_map: dict, data: dict) -> list:
     max_index = max(col_to_index(c) for c in column_map.values())
@@ -480,28 +536,16 @@ def build_row_from_map(column_map: dict, data: dict) -> list:
     return row
 
 def append_to_sheet(date, time, name, phone):
-    # If Sheets wasn't initialized, skip but LOG why
-    if not sheets_api:
-        print("Sheets append skipped: sheets_api is None (Sheets not initialized).")
-        print("Check SERVICE_ACCOUNT_JSON or SERVICE_ACCOUNT_FILE and GOOGLE_SHEETS_ID env vars.")
-        return
-
-    if not GOOGLE_SHEETS_ID:
-        print("Sheets append skipped: GOOGLE_SHEETS_ID is empty.")
-        return
+    if not sheets_api or not GOOGLE_SHEETS_ID:
+        return False
 
     try:
         header_map = get_sheet_header_map()
 
-        # If header map works, write EXACTLY under the real headers (bulletproof)
         if header_map:
             required = ["date", "time", "name", "phone", "status", "source"]
             missing = [k for k in required if k not in header_map]
-            if missing:
-                print("Sheets append FAILED: Missing headers in row 1:", missing)
-                print("Detected header map:", header_map)
-                # fall back below
-            else:
+            if not missing:
                 date_i = _col_to_idx(header_map["date"])
                 time_i = _col_to_idx(header_map["time"])
                 name_i = _col_to_idx(header_map["name"])
@@ -519,10 +563,6 @@ def append_to_sheet(date, time, name, phone):
                 row_values[status_i] = "Booked"
                 row_values[source_i] = "WhatsApp"
 
-                print("APPEND HEADER MAP:", header_map)
-                print("APPEND RANGE:", a1(SHEET_TAB, "A:F"))
-                print("APPEND VALUES:", row_values)
-
                 sheets_api.values().append(
                     spreadsheetId=GOOGLE_SHEETS_ID,
                     range=a1(SHEET_TAB, "A:F"),
@@ -530,10 +570,8 @@ def append_to_sheet(date, time, name, phone):
                     insertDataOption="INSERT_ROWS",
                     body={"values": [row_values]}
                 ).execute()
-                print("Sheets append OK:", date, time, name, phone)
-                return
+                return True
 
-        # Fallback to clean A–F layout
         column_map = {
             "date": "A",
             "time": "B",
@@ -554,9 +592,6 @@ def append_to_sheet(date, time, name, phone):
 
         row_values = build_row_from_map(column_map, data)
 
-        print("APPEND RANGE:", a1(SHEET_TAB, "A:F"))
-        print("APPEND VALUES:", row_values)
-
         sheets_api.values().append(
             spreadsheetId=GOOGLE_SHEETS_ID,
             range=a1(SHEET_TAB, "A:F"),
@@ -564,10 +599,12 @@ def append_to_sheet(date, time, name, phone):
             insertDataOption="INSERT_ROWS",
             body={"values": [row_values]}
         ).execute()
-        print("Sheets append OK:", date, time, name, phone)
+
+        return True
 
     except Exception as e:
         print("Sheets append FAILED:", repr(e))
+        return False
 
 # -------------------------------------------------
 # Flask App
@@ -605,6 +642,40 @@ def whatsapp_webhook():
     # Save inbound message with sid
     save_message(clinic_id, user, "user", incoming, twilio_sid=twilio_sid)
 
+    # ✅ ADMIN COMMAND: retry sheets
+    if incoming.strip().lower() == "retry sheets":
+        if not is_admin(user):
+            reply = "Not authorized. (Set ADMIN_WHATSAPP in env vars to enable this command.)"
+            msg.body(reply)
+            save_message(clinic_id, user, "assistant", reply)
+            return Response(str(resp), mimetype="application/xml")
+
+        rows = get_unsynced_appointments(clinic_id, limit=20)
+        if not rows:
+            reply = "No pending/failed sheet syncs found."
+            msg.body(reply)
+            save_message(clinic_id, user, "assistant", reply)
+            return Response(str(resp), mimetype="application/xml")
+
+        attempted = 0
+        synced = 0
+        failed = 0
+
+        for (appt_id, appt_user, appt_name, appt_date, appt_time, appt_status) in rows:
+            attempted += 1
+            ok = append_to_sheet(appt_date, appt_time, appt_name, appt_user)
+            if ok:
+                synced += 1
+                update_sheet_sync_status(appt_id, "synced")
+            else:
+                failed += 1
+                update_sheet_sync_status(appt_id, "failed", "Retry sheets failed (see logs)")
+
+        reply = f"Retry complete ✅\nAttempted: {attempted}\nSynced: {synced}\nFailed: {failed}"
+        msg.body(reply)
+        save_message(clinic_id, user, "assistant", reply)
+        return Response(str(resp), mimetype="application/xml")
+
     context = get_context(clinic_id, user)
 
     if incoming.lower() == "reset":
@@ -612,16 +683,13 @@ def whatsapp_webhook():
         reply = "Session reset. You can start again."
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
-        print("TWIML OUT:", str(resp))
         return Response(str(resp), mimetype="application/xml")
 
-    # Booking flow
     if context == "awaiting_name":
         set_context(clinic_id, user, f"name:{incoming}")
         reply = "What date would you like? (YYYY-MM-DD)"
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
-        print("TWIML OUT:", str(resp))
         return Response(str(resp), mimetype="application/xml")
 
     if context.startswith("name:") and "|date:" not in context:
@@ -631,13 +699,11 @@ def whatsapp_webhook():
             reply = "What time would you prefer? (HH:MM) e.g. 14:00"
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
-            print("TWIML OUT:", str(resp))
             return Response(str(resp), mimetype="application/xml")
         else:
             reply = "Please type the date like 2026-01-15 (YYYY-MM-DD)."
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
-            print("TWIML OUT:", str(resp))
             return Response(str(resp), mimetype="application/xml")
 
     if "|date:" in context and "|time:" not in context:
@@ -650,20 +716,17 @@ def whatsapp_webhook():
                 reply = "That slot is already booked. Choose another time."
                 msg.body(reply)
                 save_message(clinic_id, user, "assistant", reply)
-                print("TWIML OUT:", str(resp))
                 return Response(str(resp), mimetype="application/xml")
 
             set_context(clinic_id, user, f"name:{name}|date:{date}|time:{incoming}")
             reply = f"Confirm appointment on {date} at {incoming}? (yes/no)"
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
-            print("TWIML OUT:", str(resp))
             return Response(str(resp), mimetype="application/xml")
         else:
             reply = "Please type the time like 09:30 (HH:MM) e.g. 14:00."
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
-            print("TWIML OUT:", str(resp))
             return Response(str(resp), mimetype="application/xml")
 
     if "|time:" in context:
@@ -673,11 +736,9 @@ def whatsapp_webhook():
             date = parts[1].split("date:", 1)[1]
             time = parts[2].split("time:", 1)[1]
 
-            # ✅ DB-safe insert (protected by unique index). Catch race duplicates.
             try:
-                save_appointment_local(clinic_id, user, name, date, time)
+                appt_id = save_appointment_local(clinic_id, user, name, date, time)
             except psycopg2.Error as e:
-                # 23505 = unique_violation
                 if getattr(e, "pgcode", None) == "23505":
                     reply = "That slot is already booked. Choose another time."
                     msg.body(reply)
@@ -685,13 +746,17 @@ def whatsapp_webhook():
                     return Response(str(resp), mimetype="application/xml")
                 raise
 
-            append_to_sheet(date, time, name, user)
+            ok = append_to_sheet(date, time, name, user)
+            if ok:
+                update_sheet_sync_status(appt_id, "synced")
+            else:
+                update_sheet_sync_status(appt_id, "failed", "Sheets append failed (see logs)")
+
             clear_context(clinic_id, user)
 
             reply = f"✅ Appointment confirmed for {date} at {time}"
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
-            print("TWIML OUT:", str(resp))
             return Response(str(resp), mimetype="application/xml")
 
         if incoming.lower() in ["no", "n"]:
@@ -699,38 +764,30 @@ def whatsapp_webhook():
             reply = "No problem — booking cancelled. Type 'book' to start again."
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
-            print("TWIML OUT:", str(resp))
             return Response(str(resp), mimetype="application/xml")
 
         reply = "Please reply with 'yes' to confirm or 'no' to cancel."
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
-        print("TWIML OUT:", str(resp))
         return Response(str(resp), mimetype="application/xml")
 
-    # If user is trying to book, start the real booking flow
     if is_booking_intent(incoming):
         set_context(clinic_id, user, "awaiting_name")
         reply = "Sure. What's your full name?"
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
-        print("TWIML OUT:", str(resp))
         return Response(str(resp), mimetype="application/xml")
 
-    # Safety nudge
     maybe_booking_words = ["dent", "tooth", "teeth", "pain", "ache", "clean", "check", "braces", "gum"]
     if any(w in incoming.lower() for w in maybe_booking_words):
         reply = "If you'd like to book an appointment, please type 'book'."
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
-        print("TWIML OUT:", str(resp))
         return Response(str(resp), mimetype="application/xml")
 
-    # Otherwise, use AI for general replies
     reply = ai_reply(clinic_id, user, incoming)
     msg.body(reply)
     save_message(clinic_id, user, "assistant", reply)
-    print("TWIML OUT:", str(resp))
     return Response(str(resp), mimetype="application/xml")
 
 # -------------------------------------------------

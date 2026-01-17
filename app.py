@@ -158,12 +158,40 @@ ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "").strip()
 CLINIC_NAME = os.getenv("CLINIC_NAME", "PrimeCare Medical Centre")
 
 def normalize_admin_number(s: str) -> str:
-    return (s or "").strip().replace("whatsapp:", "")
+    """
+    Normalizes phone numbers to compare reliably:
+    - strips whatsapp:
+    - supports Kenyan local '07...' by converting to +2547...
+    - supports '2547...' by converting to +2547...
+    - keeps + if present
+    """
+    raw = (s or "").strip().replace("whatsapp:", "").strip()
+    digits = re.sub(r"[^\d+]", "", raw)
 
-def is_admin(user_number: str) -> bool:
-    if not ADMIN_WHATSAPP:
-        return False
-    return normalize_admin_number(user_number) == normalize_admin_number(ADMIN_WHATSAPP)
+    # If it's like 0728..., convert to +254728...
+    if digits.startswith("0") and len(digits) == 10:
+        return "+254" + digits[1:]
+
+    # If it's like 2547..., convert to +2547...
+    if digits.startswith("254") and not digits.startswith("+"):
+        return "+" + digits
+
+    return digits
+
+def is_admin(user_number: str, clinic_settings: dict) -> bool:
+    # 1) DB-driven admins list (preferred)
+    admins = clinic_settings.get("admins", [])
+    user_norm = normalize_admin_number(user_number)
+
+    for a in admins:
+        if user_norm == normalize_admin_number(str(a)):
+            return True
+
+    # 2) Env fallback (keeps your existing setup working)
+    if ADMIN_WHATSAPP:
+        return user_norm == normalize_admin_number(ADMIN_WHATSAPP)
+
+    return False
 
 # -------------------------------------------------
 # OpenAI Client
@@ -236,6 +264,15 @@ def init_db():
     c.execute("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sheet_sync_error text")
     c.execute("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sheet_synced_at timestamptz")
     c.execute("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS cancelled_at timestamptz")
+
+    # ✅ Clinic settings table (safe)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS clinic_settings (
+            clinic_id uuid PRIMARY KEY REFERENCES clinics(id) ON DELETE CASCADE,
+            settings jsonb NOT NULL DEFAULT '{}'::jsonb,
+            updated_at timestamptz NOT NULL DEFAULT now()
+        )
+    """)
 
     conn.commit()
     conn.close()
@@ -420,6 +457,25 @@ def get_todays_appointments(clinic_id, date_str):
     conn.close()
     return rows
 
+def load_clinic_settings(clinic_id):
+    try:
+        conn = db_conn()
+        c = conn.cursor()
+        c.execute("SELECT settings FROM clinic_settings WHERE clinic_id=%s", (clinic_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row or row[0] is None:
+            return {}
+        if isinstance(row[0], str):
+            try:
+                return json.loads(row[0])
+            except:
+                return {}
+        return row[0] if isinstance(row[0], dict) else {}
+    except Exception as e:
+        print("load_clinic_settings FAILED:", repr(e))
+        return {}
+
 # ✅ STATE MACHINE HELPERS (patch-only add-on)
 def get_state_and_draft(clinic_id, user):
     conn = db_conn()
@@ -435,7 +491,6 @@ def get_state_and_draft(clinic_id, user):
     state, draft = row[0], row[1]
     if draft is None:
         draft = {}
-    # psycopg2 may return dict for jsonb, or string depending on settings
     if isinstance(draft, str):
         try:
             draft = json.loads(draft)
@@ -534,27 +589,6 @@ def check_double_booking(clinic_id, date, time):
         print("Sheets check error:", repr(e))
 
     return False
-
-# -------------------------------------------------
-# Validators
-# -------------------------------------------------
-def looks_like_date(s):
-    try:
-        datetime.datetime.strptime(s.strip(), "%Y-%m-%d")
-        return True
-    except:
-        return False
-
-def looks_like_time(s):
-    try:
-        datetime.datetime.strptime(s.strip(), "%H:%M")
-        return True
-    except:
-        try:
-            datetime.datetime.strptime(s.strip(), "%I:%M %p")
-            return True
-        except:
-            return False
 
 # -------------------------------------------------
 # Booking intent
@@ -733,6 +767,8 @@ def whatsapp_webhook():
         msg.body("This WhatsApp line is not linked to a clinic yet.")
         return Response(str(resp), mimetype="application/xml")
 
+    clinic_settings = load_clinic_settings(clinic_id)
+
     # ✅ Idempotency: ignore Twilio retries
     twilio_sid = (request.values.get("MessageSid") or "").strip()
     if twilio_sid and already_processed_twilio_sid(twilio_sid):
@@ -744,7 +780,7 @@ def whatsapp_webhook():
 
     # ✅ ADMIN COMMAND: today
     if incoming.strip().lower() == "today":
-        if not is_admin(user):
+        if not is_admin(user, clinic_settings):
             reply = "Not authorized."
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
@@ -768,8 +804,8 @@ def whatsapp_webhook():
 
     # ✅ ADMIN COMMAND: retry sheets
     if incoming.strip().lower() == "retry sheets":
-        if not is_admin(user):
-            reply = "Not authorized. (Set ADMIN_WHATSAPP in env vars to enable this command.)"
+        if not is_admin(user, clinic_settings):
+            reply = "Not authorized."
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
@@ -916,7 +952,6 @@ def whatsapp_webhook():
                     reply = "That slot is already booked. Choose another time."
                     msg.body(reply)
                     save_message(clinic_id, user, "assistant", reply)
-                    # keep them in collect_time to pick another time
                     set_state_and_draft(clinic_id, user, "collect_time", {"name": name, "date": date})
                     return Response(str(resp), mimetype="application/xml")
                 raise

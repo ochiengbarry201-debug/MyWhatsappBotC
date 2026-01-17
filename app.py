@@ -1,5 +1,6 @@
 import os
 import psycopg2
+import psycopg2.extras
 import datetime
 import re
 import json
@@ -54,11 +55,9 @@ def a1(tab: str, cells: str) -> str:
 
 # ✅ PATCH: Header-driven mapping so we never drift to K–U again
 def _norm_header(s: str) -> str:
-    # normalize: lowercase, trim, collapse spaces
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 def _index_to_col(idx: int) -> str:
-    # 0 -> A, 25 -> Z, 26 -> AA ...
     idx += 1
     out = ""
     while idx > 0:
@@ -67,11 +66,6 @@ def _index_to_col(idx: int) -> str:
     return out
 
 def get_sheet_header_map():
-    """
-    Reads row 1 (A1:Z1) and returns column letters for the fields we need:
-    date, time, name, phone, status, source.
-    This adapts even if your headers shift.
-    """
     if not sheets_api:
         return None
 
@@ -82,14 +76,12 @@ def get_sheet_header_map():
         ).execute()
         header_row = (res.get("values") or [[]])[0]
 
-        # Map normalized header text -> index
         header_index = {}
         for i, cell in enumerate(header_row):
             key = _norm_header(cell)
             if key:
                 header_index[key] = i
 
-        # Adjust these variants to match your sheet header words
         wanted = {
             "date": ["date", "appointment date", "booking date"],
             "time": ["time", "appointment time", "booking time"],
@@ -116,7 +108,6 @@ def get_sheet_header_map():
         return None
 
 def _col_to_idx(col: str) -> int:
-    # A->0, Z->25, AA->26...
     col = (col or "").strip().upper()
     n = 0
     for ch in col:
@@ -144,7 +135,6 @@ if True:
             sheets_api = sheets_service.spreadsheets()
             print("Google Sheets initialized")
 
-            # TEMP: Confirm access to the spreadsheet ID (helps debug 404 issues)
             try:
                 meta = sheets_api.get(spreadsheetId=GOOGLE_SHEETS_ID).execute()
                 print("Sheets access OK. Title:", meta.get("properties", {}).get("title"))
@@ -171,7 +161,6 @@ def normalize_admin_number(s: str) -> str:
     return (s or "").strip().replace("whatsapp:", "")
 
 def is_admin(user_number: str) -> bool:
-    # If not set, we don't allow admin commands (safer)
     if not ADMIN_WHATSAPP:
         return False
     return normalize_admin_number(user_number) == normalize_admin_number(ADMIN_WHATSAPP)
@@ -225,6 +214,10 @@ def init_db():
         )
     """)
 
+    # ✅ state machine columns (safe if already added)
+    c.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS current_state text DEFAULT 'idle'")
+    c.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS draft jsonb DEFAULT '{}'::jsonb")
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS appointments (
             id SERIAL PRIMARY KEY,
@@ -242,6 +235,7 @@ def init_db():
     c.execute("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sheet_sync_status text DEFAULT 'pending'")
     c.execute("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sheet_sync_error text")
     c.execute("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sheet_synced_at timestamptz")
+    c.execute("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS cancelled_at timestamptz")
 
     conn.commit()
     conn.close()
@@ -342,7 +336,6 @@ def update_sheet_sync_status(appointment_id, status, error=None):
     except Exception as e:
         print("update_sheet_sync_status FAILED:", repr(e))
 
-# ✅ Add-on: fetch unsynced appointments for retry
 def get_unsynced_appointments(clinic_id, limit=20):
     conn = db_conn()
     c = conn.cursor()
@@ -361,6 +354,113 @@ def get_unsynced_appointments(clinic_id, limit=20):
     rows = c.fetchall()
     conn.close()
     return rows
+
+def cancel_latest_appointment(clinic_id, user):
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, name, date, time
+        FROM appointments
+        WHERE clinic_id=%s AND user_number=%s AND status='Booked'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (clinic_id, user)
+    )
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    appt_id, name, date, time = row
+    c.execute(
+        """
+        UPDATE appointments
+        SET status='Cancelled',
+            cancelled_at=now()
+        WHERE id=%s
+        """,
+        (appt_id,)
+    )
+    conn.commit()
+    conn.close()
+    return {"id": appt_id, "name": name, "date": date, "time": time}
+
+def get_latest_booked_appointment(clinic_id, user):
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, name, date, time, created_at
+        FROM appointments
+        WHERE clinic_id=%s AND user_number=%s AND status='Booked'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (clinic_id, user)
+    )
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def get_todays_appointments(clinic_id, date_str):
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT name, user_number, time, sheet_sync_status
+        FROM appointments
+        WHERE clinic_id=%s AND date=%s AND status='Booked'
+        ORDER BY time ASC
+        """,
+        (clinic_id, date_str)
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+# ✅ STATE MACHINE HELPERS (patch-only add-on)
+def get_state_and_draft(clinic_id, user):
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute(
+        "SELECT current_state, draft FROM conversations WHERE clinic_id=%s AND user_number=%s",
+        (clinic_id, user)
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return ("idle", {})
+    state, draft = row[0], row[1]
+    if draft is None:
+        draft = {}
+    # psycopg2 may return dict for jsonb, or string depending on settings
+    if isinstance(draft, str):
+        try:
+            draft = json.loads(draft)
+        except:
+            draft = {}
+    return (state or "idle", draft if isinstance(draft, dict) else {})
+
+def set_state_and_draft(clinic_id, user, state, draft):
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO conversations (clinic_id, user_number, context, current_state, draft)
+        VALUES (%s,%s,'',%s,%s)
+        ON CONFLICT (clinic_id, user_number)
+        DO UPDATE SET current_state=EXCLUDED.current_state,
+                      draft=EXCLUDED.draft
+        """,
+        (clinic_id, user, state, psycopg2.extras.Json(draft or {}))
+    )
+    conn.commit()
+    conn.close()
+
+def clear_state_machine(clinic_id, user):
+    set_state_and_draft(clinic_id, user, "idle", {})
 
 # -------------------------------------------------
 # Clinic resolver
@@ -642,6 +742,30 @@ def whatsapp_webhook():
     # Save inbound message with sid
     save_message(clinic_id, user, "user", incoming, twilio_sid=twilio_sid)
 
+    # ✅ ADMIN COMMAND: today
+    if incoming.strip().lower() == "today":
+        if not is_admin(user):
+            reply = "Not authorized."
+            msg.body(reply)
+            save_message(clinic_id, user, "assistant", reply)
+            return Response(str(resp), mimetype="application/xml")
+
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        rows = get_todays_appointments(clinic_id, today)
+        if not rows:
+            reply = f"No booked appointments for today ({today})."
+            msg.body(reply)
+            save_message(clinic_id, user, "assistant", reply)
+            return Response(str(resp), mimetype="application/xml")
+
+        lines = [f"Today ({today}) appointments:"]
+        for (name, phone, time, sync_status) in rows[:30]:
+            lines.append(f"- {time} | {name} | {phone} | sheets:{sync_status}")
+        reply = "\n".join(lines)
+        msg.body(reply)
+        save_message(clinic_id, user, "assistant", reply)
+        return Response(str(resp), mimetype="application/xml")
+
     # ✅ ADMIN COMMAND: retry sheets
     if incoming.strip().lower() == "retry sheets":
         if not is_admin(user):
@@ -676,26 +800,77 @@ def whatsapp_webhook():
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
-    context = get_context(clinic_id, user)
+    # ✅ PATIENT COMMAND: my appointment
+    if incoming.strip().lower() == "my appointment":
+        appt = get_latest_booked_appointment(clinic_id, user)
+        if not appt:
+            reply = "You have no booked appointments right now."
+        else:
+            appt_id, name, date, time, created_at = appt
+            reply = f"Your next appointment is on {date} at {time} under the name {name}."
+        msg.body(reply)
+        save_message(clinic_id, user, "assistant", reply)
+        return Response(str(resp), mimetype="application/xml")
 
+    # ✅ PATIENT COMMAND: cancel
+    if incoming.strip().lower() == "cancel":
+        clear_context(clinic_id, user)
+        clear_state_machine(clinic_id, user)
+        cancelled = cancel_latest_appointment(clinic_id, user)
+        if not cancelled:
+            reply = "I couldn’t find an active booked appointment to cancel."
+        else:
+            reply = f"✅ Cancelled your appointment on {cancelled['date']} at {cancelled['time']}."
+        msg.body(reply)
+        save_message(clinic_id, user, "assistant", reply)
+        return Response(str(resp), mimetype="application/xml")
+
+    # ✅ PATIENT COMMAND: reschedule
+    if incoming.strip().lower() == "reschedule":
+        clear_context(clinic_id, user)
+        cancelled = cancel_latest_appointment(clinic_id, user)
+        # Start state machine booking flow
+        set_state_and_draft(clinic_id, user, "collect_name", {})
+        if cancelled:
+            reply = f"✅ Cancelled your appointment on {cancelled['date']} at {cancelled['time']}.\nLet’s reschedule. What’s your full name?"
+        else:
+            reply = "No active appointment found, but I can help you book a new one. What’s your full name?"
+        msg.body(reply)
+        save_message(clinic_id, user, "assistant", reply)
+        return Response(str(resp), mimetype="application/xml")
+
+    # ✅ NEW BOOKING STATE MACHINE
+    state, draft = get_state_and_draft(clinic_id, user)
+
+    # reset clears both old context and new state machine
     if incoming.lower() == "reset":
         clear_context(clinic_id, user)
+        clear_state_machine(clinic_id, user)
         reply = "Session reset. You can start again."
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
-    if context == "awaiting_name":
-        set_context(clinic_id, user, f"name:{incoming}")
+    # Start booking if intent
+    if state in ["idle", None, ""] and is_booking_intent(incoming):
+        set_state_and_draft(clinic_id, user, "collect_name", {})
+        reply = "Sure. What's your full name?"
+        msg.body(reply)
+        save_message(clinic_id, user, "assistant", reply)
+        return Response(str(resp), mimetype="application/xml")
+
+    if state == "collect_name":
+        draft["name"] = incoming.strip()
+        set_state_and_draft(clinic_id, user, "collect_date", draft)
         reply = "What date would you like? (YYYY-MM-DD)"
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
-    if context.startswith("name:") and "|date:" not in context:
+    if state == "collect_date":
         if looks_like_date(incoming):
-            name = context.split("name:", 1)[1]
-            set_context(clinic_id, user, f"name:{name}|date:{incoming}")
+            draft["date"] = incoming.strip()
+            set_state_and_draft(clinic_id, user, "collect_time", draft)
             reply = "What time would you prefer? (HH:MM) e.g. 14:00"
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
@@ -706,20 +881,19 @@ def whatsapp_webhook():
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
-    if "|date:" in context and "|time:" not in context:
+    if state == "collect_time":
         if looks_like_time(incoming):
-            parts = context.split("|")
-            name = parts[0].split("name:", 1)[1]
-            date = parts[1].split("date:", 1)[1]
-
-            if check_double_booking(clinic_id, date, incoming):
+            date = draft.get("date", "")
+            time = incoming.strip()
+            if check_double_booking(clinic_id, date, time):
                 reply = "That slot is already booked. Choose another time."
                 msg.body(reply)
                 save_message(clinic_id, user, "assistant", reply)
                 return Response(str(resp), mimetype="application/xml")
 
-            set_context(clinic_id, user, f"name:{name}|date:{date}|time:{incoming}")
-            reply = f"Confirm appointment on {date} at {incoming}? (yes/no)"
+            draft["time"] = time
+            set_state_and_draft(clinic_id, user, "confirm", draft)
+            reply = f"Confirm appointment on {date} at {time}? (yes/no)"
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
@@ -729,12 +903,11 @@ def whatsapp_webhook():
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
-    if "|time:" in context:
+    if state == "confirm":
         if incoming.lower() in ["yes", "y"]:
-            parts = context.split("|")
-            name = parts[0].split("name:", 1)[1]
-            date = parts[1].split("date:", 1)[1]
-            time = parts[2].split("time:", 1)[1]
+            name = draft.get("name", "").strip()
+            date = draft.get("date", "").strip()
+            time = draft.get("time", "").strip()
 
             try:
                 appt_id = save_appointment_local(clinic_id, user, name, date, time)
@@ -743,6 +916,8 @@ def whatsapp_webhook():
                     reply = "That slot is already booked. Choose another time."
                     msg.body(reply)
                     save_message(clinic_id, user, "assistant", reply)
+                    # keep them in collect_time to pick another time
+                    set_state_and_draft(clinic_id, user, "collect_time", {"name": name, "date": date})
                     return Response(str(resp), mimetype="application/xml")
                 raise
 
@@ -752,7 +927,7 @@ def whatsapp_webhook():
             else:
                 update_sheet_sync_status(appt_id, "failed", "Sheets append failed (see logs)")
 
-            clear_context(clinic_id, user)
+            clear_state_machine(clinic_id, user)
 
             reply = f"✅ Appointment confirmed for {date} at {time}"
             msg.body(reply)
@@ -760,7 +935,7 @@ def whatsapp_webhook():
             return Response(str(resp), mimetype="application/xml")
 
         if incoming.lower() in ["no", "n"]:
-            clear_context(clinic_id, user)
+            clear_state_machine(clinic_id, user)
             reply = "No problem — booking cancelled. Type 'book' to start again."
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
@@ -771,13 +946,7 @@ def whatsapp_webhook():
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
-    if is_booking_intent(incoming):
-        set_context(clinic_id, user, "awaiting_name")
-        reply = "Sure. What's your full name?"
-        msg.body(reply)
-        save_message(clinic_id, user, "assistant", reply)
-        return Response(str(resp), mimetype="application/xml")
-
+    # Safety nudge (still works when idle)
     maybe_booking_words = ["dent", "tooth", "teeth", "pain", "ache", "clean", "check", "braces", "gum"]
     if any(w in incoming.lower() for w in maybe_booking_words):
         reply = "If you'd like to book an appointment, please type 'book'."
@@ -785,6 +954,7 @@ def whatsapp_webhook():
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
+    # Otherwise, use AI for general replies
     reply = ai_reply(clinic_id, user, incoming)
     msg.body(reply)
     save_message(clinic_id, user, "assistant", reply)

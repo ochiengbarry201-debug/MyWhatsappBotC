@@ -65,14 +65,20 @@ def _index_to_col(idx: int) -> str:
         out = chr(65 + r) + out
     return out
 
-def get_sheet_header_map():
+# ✅ PATCH: allow per-clinic spreadsheet_id/tab (fallback to env)
+def get_sheet_header_map(spreadsheet_id=None, sheet_tab=None):
     if not sheets_api:
+        return None
+
+    sid = (spreadsheet_id or GOOGLE_SHEETS_ID or "").strip()
+    tab = (sheet_tab or SHEET_TAB or "Sheet1").strip()
+    if not sid:
         return None
 
     try:
         res = sheets_api.values().get(
-            spreadsheetId=GOOGLE_SHEETS_ID,
-            range=a1(SHEET_TAB, "A1:Z1")
+            spreadsheetId=sid,
+            range=a1(tab, "A1:Z1")
         ).execute()
         header_row = (res.get("values") or [[]])[0]
 
@@ -476,6 +482,12 @@ def load_clinic_settings(clinic_id):
         print("load_clinic_settings FAILED:", repr(e))
         return {}
 
+def get_clinic_sheet_config(clinic_settings: dict):
+    sheet = clinic_settings.get("sheet", {}) if isinstance(clinic_settings, dict) else {}
+    sid = (sheet.get("spreadsheet_id") or GOOGLE_SHEETS_ID or "").strip()
+    tab = (sheet.get("tab") or SHEET_TAB or "Sheet1").strip()
+    return sid, tab
+
 # ✅ STATE MACHINE HELPERS (patch-only add-on)
 def get_state_and_draft(clinic_id, user):
     conn = db_conn()
@@ -538,9 +550,9 @@ def resolve_clinic_id(to_number: str):
         return None
 
 # -------------------------------------------------
-# Double booking check (DB + Google Sheets)
+# Double booking check (DB + Google Sheets)  ✅ uses per-clinic sheet config
 # -------------------------------------------------
-def check_double_booking(clinic_id, date, time):
+def check_double_booking(clinic_id, date, time, sheet_id=None, sheet_tab=None):
     conn = db_conn()
     c = conn.cursor()
     c.execute(
@@ -556,16 +568,21 @@ def check_double_booking(clinic_id, date, time):
     if not sheets_api:
         return False
 
+    sid = (sheet_id or GOOGLE_SHEETS_ID or "").strip()
+    tab = (sheet_tab or SHEET_TAB or "Sheet1").strip()
+    if not sid:
+        return False
+
     try:
-        header_map = get_sheet_header_map()
+        header_map = get_sheet_header_map(sid, tab)
 
         if header_map and "date" in header_map and "time" in header_map:
             date_i = _col_to_idx(header_map["date"])
             time_i = _col_to_idx(header_map["time"])
 
             res = sheets_api.values().get(
-                spreadsheetId=GOOGLE_SHEETS_ID,
-                range=a1(SHEET_TAB, "A2:Z")
+                spreadsheetId=sid,
+                range=a1(tab, "A2:Z")
             ).execute()
 
             for row in res.get("values", []):
@@ -577,8 +594,8 @@ def check_double_booking(clinic_id, date, time):
             return False
 
         res = sheets_api.values().get(
-            spreadsheetId=GOOGLE_SHEETS_ID,
-            range=a1(SHEET_TAB, "A2:F")
+            spreadsheetId=sid,
+            range=a1(tab, "A2:F")
         ).execute()
 
         for row in res.get("values", []):
@@ -589,6 +606,27 @@ def check_double_booking(clinic_id, date, time):
         print("Sheets check error:", repr(e))
 
     return False
+
+# -------------------------------------------------
+# Validators
+# -------------------------------------------------
+def looks_like_date(s):
+    try:
+        datetime.datetime.strptime(s.strip(), "%Y-%m-%d")
+        return True
+    except:
+        return False
+
+def looks_like_time(s):
+    try:
+        datetime.datetime.strptime(s.strip(), "%H:%M")
+        return True
+    except:
+        try:
+            datetime.datetime.strptime(s.strip(), "%I:%M %p")
+            return True
+        except:
+            return False
 
 # -------------------------------------------------
 # Booking intent
@@ -656,7 +694,7 @@ def save_appointment_local(clinic_id, user, name, date, time):
     return appt_id
 
 # -------------------------------------------------
-# Sheets append (returns True/False)
+# Sheets append (returns True/False)  ✅ uses per-clinic sheet config
 # -------------------------------------------------
 def col_to_index(col: str) -> int:
     col = col.strip().upper()
@@ -669,12 +707,17 @@ def build_row_from_map(column_map: dict, data: dict) -> list:
         row[col_to_index(col)] = data.get(field, "")
     return row
 
-def append_to_sheet(date, time, name, phone):
-    if not sheets_api or not GOOGLE_SHEETS_ID:
+def append_to_sheet(date, time, name, phone, sheet_id=None, sheet_tab=None):
+    if not sheets_api:
+        return False
+
+    sid = (sheet_id or GOOGLE_SHEETS_ID or "").strip()
+    tab = (sheet_tab or SHEET_TAB or "Sheet1").strip()
+    if not sid:
         return False
 
     try:
-        header_map = get_sheet_header_map()
+        header_map = get_sheet_header_map(sid, tab)
 
         if header_map:
             required = ["date", "time", "name", "phone", "status", "source"]
@@ -698,14 +741,15 @@ def append_to_sheet(date, time, name, phone):
                 row_values[source_i] = "WhatsApp"
 
                 sheets_api.values().append(
-                    spreadsheetId=GOOGLE_SHEETS_ID,
-                    range=a1(SHEET_TAB, "A:F"),
+                    spreadsheetId=sid,
+                    range=a1(tab, "A:F"),
                     valueInputOption="USER_ENTERED",
                     insertDataOption="INSERT_ROWS",
                     body={"values": [row_values]}
                 ).execute()
                 return True
 
+        # fallback A–F
         column_map = {
             "date": "A",
             "time": "B",
@@ -727,8 +771,8 @@ def append_to_sheet(date, time, name, phone):
         row_values = build_row_from_map(column_map, data)
 
         sheets_api.values().append(
-            spreadsheetId=GOOGLE_SHEETS_ID,
-            range=a1(SHEET_TAB, "A:F"),
+            spreadsheetId=sid,
+            range=a1(tab, "A:F"),
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": [row_values]}
@@ -768,6 +812,7 @@ def whatsapp_webhook():
         return Response(str(resp), mimetype="application/xml")
 
     clinic_settings = load_clinic_settings(clinic_id)
+    clinic_sheet_id, clinic_sheet_tab = get_clinic_sheet_config(clinic_settings)
 
     # ✅ Idempotency: ignore Twilio retries
     twilio_sid = (request.values.get("MessageSid") or "").strip()
@@ -823,7 +868,7 @@ def whatsapp_webhook():
 
         for (appt_id, appt_user, appt_name, appt_date, appt_time, appt_status) in rows:
             attempted += 1
-            ok = append_to_sheet(appt_date, appt_time, appt_name, appt_user)
+            ok = append_to_sheet(appt_date, appt_time, appt_name, appt_user, clinic_sheet_id, clinic_sheet_tab)
             if ok:
                 synced += 1
                 update_sheet_sync_status(appt_id, "synced")
@@ -865,7 +910,6 @@ def whatsapp_webhook():
     if incoming.strip().lower() == "reschedule":
         clear_context(clinic_id, user)
         cancelled = cancel_latest_appointment(clinic_id, user)
-        # Start state machine booking flow
         set_state_and_draft(clinic_id, user, "collect_name", {})
         if cancelled:
             reply = f"✅ Cancelled your appointment on {cancelled['date']} at {cancelled['time']}.\nLet’s reschedule. What’s your full name?"
@@ -878,7 +922,6 @@ def whatsapp_webhook():
     # ✅ NEW BOOKING STATE MACHINE
     state, draft = get_state_and_draft(clinic_id, user)
 
-    # reset clears both old context and new state machine
     if incoming.lower() == "reset":
         clear_context(clinic_id, user)
         clear_state_machine(clinic_id, user)
@@ -921,7 +964,7 @@ def whatsapp_webhook():
         if looks_like_time(incoming):
             date = draft.get("date", "")
             time = incoming.strip()
-            if check_double_booking(clinic_id, date, time):
+            if check_double_booking(clinic_id, date, time, clinic_sheet_id, clinic_sheet_tab):
                 reply = "That slot is already booked. Choose another time."
                 msg.body(reply)
                 save_message(clinic_id, user, "assistant", reply)
@@ -956,7 +999,7 @@ def whatsapp_webhook():
                     return Response(str(resp), mimetype="application/xml")
                 raise
 
-            ok = append_to_sheet(date, time, name, user)
+            ok = append_to_sheet(date, time, name, user, clinic_sheet_id, clinic_sheet_tab)
             if ok:
                 update_sheet_sync_status(appt_id, "synced")
             else:
@@ -981,7 +1024,6 @@ def whatsapp_webhook():
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
-    # Safety nudge (still works when idle)
     maybe_booking_words = ["dent", "tooth", "teeth", "pain", "ache", "clean", "check", "braces", "gum"]
     if any(w in incoming.lower() for w in maybe_booking_words):
         reply = "If you'd like to book an appointment, please type 'book'."
@@ -989,7 +1031,6 @@ def whatsapp_webhook():
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
-    # Otherwise, use AI for general replies
     reply = ai_reply(clinic_id, user, incoming)
     msg.body(reply)
     save_message(clinic_id, user, "assistant", reply)

@@ -34,6 +34,10 @@ SERVICE_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "").strip()
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", "").strip()
 SHEET_TAB = os.getenv("GOOGLE_SHEETS_TAB", "Sheet1").strip()
 
+# ✅ Default sheet fallback (if DB settings + env are missing)
+DEFAULT_SHEET_ID = "15W9oICScP7ecJvacczeuCmlHVAvJ2QmVSH9tJgSiQBo"
+DEFAULT_SHEET_TAB = "Sheet1"
+
 sheets_api = None
 
 def load_service_info():
@@ -70,8 +74,8 @@ def get_sheet_header_map(spreadsheet_id=None, sheet_tab=None):
     if not sheets_api:
         return None
 
-    sid = (spreadsheet_id or GOOGLE_SHEETS_ID or "").strip()
-    tab = (sheet_tab or SHEET_TAB or "Sheet1").strip()
+    sid = (spreadsheet_id or GOOGLE_SHEETS_ID or DEFAULT_SHEET_ID or "").strip()
+    tab = (sheet_tab or SHEET_TAB or DEFAULT_SHEET_TAB or "Sheet1").strip()
     if not sid:
         return None
 
@@ -129,9 +133,9 @@ if True:
         print("Service account load failed:", repr(e))
         service_info = None
 
-    if service_info and GOOGLE_SHEETS_ID:
+    if service_info and (GOOGLE_SHEETS_ID or DEFAULT_SHEET_ID):
         try:
-            print("Sheets target ID:", GOOGLE_SHEETS_ID)
+            print("Sheets target ID:", GOOGLE_SHEETS_ID or DEFAULT_SHEET_ID)
             print("Service account email:", service_info.get("client_email"))
             print("Sheets tab:", SHEET_TAB)
 
@@ -141,8 +145,9 @@ if True:
             sheets_api = sheets_service.spreadsheets()
             print("Google Sheets initialized")
 
+            # TEMP: Confirm access to the spreadsheet ID (helps debug 404 issues)
             try:
-                meta = sheets_api.get(spreadsheetId=GOOGLE_SHEETS_ID).execute()
+                meta = sheets_api.get(spreadsheetId=(GOOGLE_SHEETS_ID or DEFAULT_SHEET_ID)).execute()
                 print("Sheets access OK. Title:", meta.get("properties", {}).get("title"))
             except Exception as e:
                 print("Sheets access TEST FAILED:", repr(e))
@@ -150,10 +155,7 @@ if True:
         except Exception as e:
             print("Google Sheets init failed:", repr(e))
     else:
-        if not GOOGLE_SHEETS_ID:
-            print("GOOGLE_SHEETS_ID not set — Sheets disabled")
-        else:
-            print("Service account not set — Sheets disabled (set SERVICE_ACCOUNT_JSON or SERVICE_ACCOUNT_FILE)")
+        print("Service account not set or sheet id not set — Sheets disabled")
 
 # -------------------------------------------------
 # Environment variables
@@ -174,11 +176,9 @@ def normalize_admin_number(s: str) -> str:
     raw = (s or "").strip().replace("whatsapp:", "").strip()
     digits = re.sub(r"[^\d+]", "", raw)
 
-    # If it's like 0728..., convert to +254728...
     if digits.startswith("0") and len(digits) == 10:
         return "+254" + digits[1:]
 
-    # If it's like 2547..., convert to +2547...
     if digits.startswith("254") and not digits.startswith("+"):
         return "+" + digits
 
@@ -463,6 +463,7 @@ def get_todays_appointments(clinic_id, date_str):
     conn.close()
     return rows
 
+# ✅ PATCH: clinic settings loader + per-clinic sheet config getter
 def load_clinic_settings(clinic_id):
     try:
         conn = db_conn()
@@ -484,8 +485,8 @@ def load_clinic_settings(clinic_id):
 
 def get_clinic_sheet_config(clinic_settings: dict):
     sheet = clinic_settings.get("sheet", {}) if isinstance(clinic_settings, dict) else {}
-    sid = (sheet.get("spreadsheet_id") or GOOGLE_SHEETS_ID or "").strip()
-    tab = (sheet.get("tab") or SHEET_TAB or "Sheet1").strip()
+    sid = (sheet.get("spreadsheet_id") or GOOGLE_SHEETS_ID or DEFAULT_SHEET_ID or "").strip()
+    tab = (sheet.get("tab") or SHEET_TAB or DEFAULT_SHEET_TAB or "Sheet1").strip()
     return sid, tab
 
 # ✅ STATE MACHINE HELPERS (patch-only add-on)
@@ -568,8 +569,8 @@ def check_double_booking(clinic_id, date, time, sheet_id=None, sheet_tab=None):
     if not sheets_api:
         return False
 
-    sid = (sheet_id or GOOGLE_SHEETS_ID or "").strip()
-    tab = (sheet_tab or SHEET_TAB or "Sheet1").strip()
+    sid = (sheet_id or GOOGLE_SHEETS_ID or DEFAULT_SHEET_ID or "").strip()
+    tab = (sheet_tab or SHEET_TAB or DEFAULT_SHEET_TAB or "Sheet1").strip()
     if not sid:
         return False
 
@@ -608,8 +609,19 @@ def check_double_booking(clinic_id, date, time, sheet_id=None, sheet_tab=None):
     return False
 
 # -------------------------------------------------
-# Validators
+# Booking intent + validators
 # -------------------------------------------------
+BOOKING_KEYWORDS = [
+    "book", "booking", "appointment", "schedule", "reschedule", "cancel",
+    "doctor", "clinic", "visit",
+    "dentist", "dental", "tooth", "teeth", "toothache", "gum", "braces",
+    "cleaning", "checkup", "check-up", "pain", "ache"
+]
+
+def is_booking_intent(text):
+    t = text.lower()
+    return any(k in t for k in BOOKING_KEYWORDS)
+
 def looks_like_date(s):
     try:
         datetime.datetime.strptime(s.strip(), "%Y-%m-%d")
@@ -627,20 +639,6 @@ def looks_like_time(s):
             return True
         except:
             return False
-
-# -------------------------------------------------
-# Booking intent
-# -------------------------------------------------
-BOOKING_KEYWORDS = [
-    "book", "booking", "appointment", "schedule", "reschedule", "cancel",
-    "doctor", "clinic", "visit",
-    "dentist", "dental", "tooth", "teeth", "toothache", "gum", "braces",
-    "cleaning", "checkup", "check-up", "pain", "ache"
-]
-
-def is_booking_intent(text):
-    t = text.lower()
-    return any(k in t for k in BOOKING_KEYWORDS)
 
 # -------------------------------------------------
 # AI Reply
@@ -711,8 +709,8 @@ def append_to_sheet(date, time, name, phone, sheet_id=None, sheet_tab=None):
     if not sheets_api:
         return False
 
-    sid = (sheet_id or GOOGLE_SHEETS_ID or "").strip()
-    tab = (sheet_tab or SHEET_TAB or "Sheet1").strip()
+    sid = (sheet_id or GOOGLE_SHEETS_ID or DEFAULT_SHEET_ID or "").strip()
+    tab = (sheet_tab or SHEET_TAB or DEFAULT_SHEET_TAB or "Sheet1").strip()
     if not sid:
         return False
 
@@ -811,6 +809,7 @@ def whatsapp_webhook():
         msg.body("This WhatsApp line is not linked to a clinic yet.")
         return Response(str(resp), mimetype="application/xml")
 
+    # ✅ LOAD clinic settings + per-clinic sheet config
     clinic_settings = load_clinic_settings(clinic_id)
     clinic_sheet_id, clinic_sheet_tab = get_clinic_sheet_config(clinic_settings)
 
@@ -930,7 +929,6 @@ def whatsapp_webhook():
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
-    # Start booking if intent
     if state in ["idle", None, ""] and is_booking_intent(incoming):
         set_state_and_draft(clinic_id, user, "collect_name", {})
         reply = "Sure. What's your full name?"
@@ -1043,3 +1041,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting {CLINIC_NAME} bot on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
+

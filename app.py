@@ -4,6 +4,9 @@ import psycopg2.extras
 import datetime
 import re
 import json
+import secrets
+import string
+from zoneinfo import ZoneInfo
 from flask import Flask, request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
@@ -20,7 +23,6 @@ from openai import OpenAI
 # -------------------------------------------------
 load_dotenv()
 
-# Debug: confirm env vars are loading (safe booleans only)
 print("LOCAL DATABASE_URL exists?", bool(os.getenv("DATABASE_URL")))
 print("LOCAL SERVICE_ACCOUNT_JSON exists?", bool(os.getenv("SERVICE_ACCOUNT_JSON")))
 print("LOCAL SERVICE_ACCOUNT_FILE exists?", bool(os.getenv("SERVICE_ACCOUNT_FILE")))
@@ -34,30 +36,25 @@ SERVICE_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "").strip()
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", "").strip()
 SHEET_TAB = os.getenv("GOOGLE_SHEETS_TAB", "Sheet1").strip()
 
-# ✅ Default sheet fallback (if DB settings + env are missing)
 DEFAULT_SHEET_ID = "15W9oICScP7ecJvacczeuCmlHVAvJ2QmVSH9tJgSiQBo"
 DEFAULT_SHEET_TAB = "Sheet1"
 
 sheets_api = None
 
 def load_service_info():
-    # 1) Prefer JSON from env (Render style)
     if SERVICE_JSON:
         return json.loads(SERVICE_JSON)
 
-    # 2) Fallback to file (Local dev style)
     if SERVICE_FILE and os.path.exists(SERVICE_FILE):
         with open(SERVICE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
 
     return None
 
-# ✅ FIX #1: Safe A1 range builder (quotes tab names with dots/spaces/parentheses)
 def a1(tab: str, cells: str) -> str:
-    safe = tab.replace("'", "''")  # escape single quotes for A1
+    safe = tab.replace("'", "''")
     return f"'{safe}'!{cells}"
 
-# ✅ PATCH: Header-driven mapping so we never drift to K–U again
 def _norm_header(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
@@ -69,7 +66,14 @@ def _index_to_col(idx: int) -> str:
         out = chr(65 + r) + out
     return out
 
-# ✅ PATCH: allow per-clinic spreadsheet_id/tab (fallback to env)
+def _col_to_idx(col: str) -> int:
+    col = (col or "").strip().upper()
+    n = 0
+    for ch in col:
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - 64)
+    return n - 1
+
 def get_sheet_header_map(spreadsheet_id=None, sheet_tab=None):
     if not sheets_api:
         return None
@@ -103,59 +107,36 @@ def get_sheet_header_map(spreadsheet_id=None, sheet_tab=None):
 
         out = {}
         for field, variants in wanted.items():
-            found_idx = None
             for v in variants:
                 vkey = _norm_header(v)
                 if vkey in header_index:
-                    found_idx = header_index[vkey]
+                    out[field] = _index_to_col(header_index[vkey])
                     break
-            if found_idx is not None:
-                out[field] = _index_to_col(found_idx)
 
         return out
     except Exception as e:
         print("Header map read failed:", repr(e))
         return None
 
-def _col_to_idx(col: str) -> int:
-    col = (col or "").strip().upper()
-    n = 0
-    for ch in col:
-        if "A" <= ch <= "Z":
-            n = n * 26 + (ord(ch) - 64)
-    return n - 1
-
-if True:
+# Init Sheets client
+service_info = None
+try:
+    service_info = load_service_info()
+except Exception as e:
+    print("Service account load failed:", repr(e))
     service_info = None
+
+if service_info and (GOOGLE_SHEETS_ID or DEFAULT_SHEET_ID):
     try:
-        service_info = load_service_info()
+        SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(service_info, scopes=SCOPES)
+        sheets_service = build("sheets", "v4", credentials=creds)
+        sheets_api = sheets_service.spreadsheets()
+        print("Google Sheets initialized")
     except Exception as e:
-        print("Service account load failed:", repr(e))
-        service_info = None
-
-    if service_info and (GOOGLE_SHEETS_ID or DEFAULT_SHEET_ID):
-        try:
-            print("Sheets target ID:", GOOGLE_SHEETS_ID or DEFAULT_SHEET_ID)
-            print("Service account email:", service_info.get("client_email"))
-            print("Sheets tab:", SHEET_TAB)
-
-            SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-            creds = Credentials.from_service_account_info(service_info, scopes=SCOPES)
-            sheets_service = build("sheets", "v4", credentials=creds)
-            sheets_api = sheets_service.spreadsheets()
-            print("Google Sheets initialized")
-
-            # TEMP: Confirm access to the spreadsheet ID (helps debug 404 issues)
-            try:
-                meta = sheets_api.get(spreadsheetId=(GOOGLE_SHEETS_ID or DEFAULT_SHEET_ID)).execute()
-                print("Sheets access OK. Title:", meta.get("properties", {}).get("title"))
-            except Exception as e:
-                print("Sheets access TEST FAILED:", repr(e))
-
-        except Exception as e:
-            print("Google Sheets init failed:", repr(e))
-    else:
-        print("Service account not set or sheet id not set — Sheets disabled")
+        print("Google Sheets init failed:", repr(e))
+else:
+    print("Service account not set or sheet id not set — Sheets disabled")
 
 # -------------------------------------------------
 # Environment variables
@@ -166,13 +147,6 @@ ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "").strip()
 CLINIC_NAME = os.getenv("CLINIC_NAME", "PrimeCare Medical Centre")
 
 def normalize_admin_number(s: str) -> str:
-    """
-    Normalizes phone numbers to compare reliably:
-    - strips whatsapp:
-    - supports Kenyan local '07...' by converting to +2547...
-    - supports '2547...' by converting to +2547...
-    - keeps + if present
-    """
     raw = (s or "").strip().replace("whatsapp:", "").strip()
     digits = re.sub(r"[^\d+]", "", raw)
 
@@ -185,7 +159,6 @@ def normalize_admin_number(s: str) -> str:
     return digits
 
 def is_admin(user_number: str, clinic_settings: dict) -> bool:
-    # 1) DB-driven admins list (preferred)
     admins = clinic_settings.get("admins", [])
     user_norm = normalize_admin_number(user_number)
 
@@ -193,7 +166,6 @@ def is_admin(user_number: str, clinic_settings: dict) -> bool:
         if user_norm == normalize_admin_number(str(a)):
             return True
 
-    # 2) Env fallback (keeps your existing setup working)
     if ADMIN_WHATSAPP:
         return user_norm == normalize_admin_number(ADMIN_WHATSAPP)
 
@@ -219,7 +191,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 def db_conn():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set. This app now requires Postgres (SQLite removed).")
+        raise RuntimeError("DATABASE_URL is not set. This app now requires Postgres.")
     print("DB: USING POSTGRESQL")
     return psycopg2.connect(DATABASE_URL)
 
@@ -234,23 +206,21 @@ def init_db():
             user_number TEXT,
             role TEXT,
             content TEXT,
-            created_at TIMESTAMP
+            created_at TIMESTAMP,
+            twilio_sid TEXT
         )
     """)
-    c.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS twilio_sid TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             clinic_id uuid,
             user_number TEXT,
             context TEXT,
+            current_state text DEFAULT 'idle',
+            draft jsonb DEFAULT '{}'::jsonb,
             PRIMARY KEY (clinic_id, user_number)
         )
     """)
-
-    # ✅ state machine columns (safe if already added)
-    c.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS current_state text DEFAULT 'idle'")
-    c.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS draft jsonb DEFAULT '{}'::jsonb")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS appointments (
@@ -262,16 +232,25 @@ def init_db():
             time TEXT,
             status TEXT,
             source TEXT,
-            created_at TIMESTAMP
+            created_at TIMESTAMP,
+            sheet_sync_status text DEFAULT 'pending',
+            sheet_sync_error text,
+            sheet_synced_at timestamptz,
+            cancelled_at timestamptz,
+            ref_code text
         )
     """)
 
-    c.execute("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sheet_sync_status text DEFAULT 'pending'")
-    c.execute("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sheet_sync_error text")
-    c.execute("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sheet_synced_at timestamptz")
-    c.execute("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS cancelled_at timestamptz")
+    # Unique index for ref_code (safe)
+    try:
+        c.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_appointments_ref_code
+            ON appointments (clinic_id, ref_code)
+            WHERE ref_code IS NOT NULL
+        """)
+    except Exception as e:
+        print("Index create uq_appointments_ref_code failed:", repr(e))
 
-    # ✅ Clinic settings table (safe)
     c.execute("""
         CREATE TABLE IF NOT EXISTS clinic_settings (
             clinic_id uuid PRIMARY KEY REFERENCES clinics(id) ON DELETE CASCADE,
@@ -324,29 +303,6 @@ def load_recent_messages(clinic_id, user, limit=12):
     conn.close()
     rows.reverse()
     return [{"role": r, "content": t} for r, t in rows]
-
-def get_context(clinic_id, user):
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("SELECT context FROM conversations WHERE clinic_id=%s AND user_number=%s", (clinic_id, user))
-    r = c.fetchone()
-    conn.close()
-    return r[0] if r else ""
-
-def set_context(clinic_id, user, ctx):
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO conversations (clinic_id, user_number, context)
-        VALUES (%s,%s,%s)
-        ON CONFLICT (clinic_id, user_number)
-        DO UPDATE SET context=EXCLUDED.context
-    """, (clinic_id, user, ctx))
-    conn.commit()
-    conn.close()
-
-def clear_context(clinic_id, user):
-    set_context(clinic_id, user, "")
 
 def update_sheet_sync_status(appointment_id, status, error=None):
     try:
@@ -403,7 +359,7 @@ def cancel_latest_appointment(clinic_id, user):
     c = conn.cursor()
     c.execute(
         """
-        SELECT id, name, date, time
+        SELECT id, name, date, time, ref_code
         FROM appointments
         WHERE clinic_id=%s AND user_number=%s AND status='Booked'
         ORDER BY created_at DESC
@@ -416,12 +372,47 @@ def cancel_latest_appointment(clinic_id, user):
         conn.close()
         return None
 
-    appt_id, name, date, time = row
+    appt_id, name, date, time, ref_code = row
     c.execute(
         """
         UPDATE appointments
-        SET status='Cancelled',
-            cancelled_at=now()
+        SET status='Cancelled', cancelled_at=now()
+        WHERE id=%s
+        """,
+        (appt_id,)
+    )
+    conn.commit()
+    conn.close()
+    return {"id": appt_id, "name": name, "date": date, "time": time, "ref_code": ref_code}
+
+def cancel_by_ref(clinic_id, user, ref_code):
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, name, date, time, user_number
+        FROM appointments
+        WHERE clinic_id=%s AND ref_code=%s AND status='Booked'
+        LIMIT 1
+        """,
+        (clinic_id, ref_code)
+    )
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    appt_id, name, date, time, booked_user = row
+
+    # Safety: only allow the same user to cancel by ref
+    if (booked_user or "") != (user or ""):
+        conn.close()
+        return "not_owner"
+
+    c.execute(
+        """
+        UPDATE appointments
+        SET status='Cancelled', cancelled_at=now()
         WHERE id=%s
         """,
         (appt_id,)
@@ -435,7 +426,7 @@ def get_latest_booked_appointment(clinic_id, user):
     c = conn.cursor()
     c.execute(
         """
-        SELECT id, name, date, time, created_at
+        SELECT id, name, date, time, created_at, ref_code
         FROM appointments
         WHERE clinic_id=%s AND user_number=%s AND status='Booked'
         ORDER BY created_at DESC
@@ -452,7 +443,7 @@ def get_todays_appointments(clinic_id, date_str):
     c = conn.cursor()
     c.execute(
         """
-        SELECT name, user_number, time, sheet_sync_status
+        SELECT name, user_number, time, sheet_sync_status, ref_code
         FROM appointments
         WHERE clinic_id=%s AND date=%s AND status='Booked'
         ORDER BY time ASC
@@ -463,7 +454,6 @@ def get_todays_appointments(clinic_id, date_str):
     conn.close()
     return rows
 
-# ✅ PATCH: clinic settings loader + per-clinic sheet config getter
 def load_clinic_settings(clinic_id):
     try:
         conn = db_conn()
@@ -489,7 +479,126 @@ def get_clinic_sheet_config(clinic_settings: dict):
     tab = (sheet.get("tab") or SHEET_TAB or DEFAULT_SHEET_TAB or "Sheet1").strip()
     return sid, tab
 
-# ✅ STATE MACHINE HELPERS (patch-only add-on)
+# -------------------------------------------------
+# Business Hours (per clinic settings)
+# -------------------------------------------------
+DEFAULT_HOURS = {
+    "timezone": "Africa/Nairobi",
+    "slot_minutes": 30,
+    "weekly": {
+        "mon": [{"start": "09:00", "end": "17:00"}],
+        "tue": [{"start": "09:00", "end": "17:00"}],
+        "wed": [{"start": "09:00", "end": "17:00"}],
+        "thu": [{"start": "09:00", "end": "17:00"}],
+        "fri": [{"start": "09:00", "end": "17:00"}],
+        "sat": [{"start": "09:00", "end": "13:00"}],
+        "sun": []
+    }
+}
+
+def get_hours_settings(clinic_settings: dict):
+    hours = clinic_settings.get("hours") if isinstance(clinic_settings, dict) else None
+    if not isinstance(hours, dict):
+        hours = DEFAULT_HOURS
+    timezone = (hours.get("timezone") or DEFAULT_HOURS["timezone"]).strip()
+    slot_minutes = hours.get("slot_minutes", DEFAULT_HOURS["slot_minutes"])
+    try:
+        slot_minutes = int(slot_minutes)
+        if slot_minutes <= 0:
+            slot_minutes = DEFAULT_HOURS["slot_minutes"]
+    except:
+        slot_minutes = DEFAULT_HOURS["slot_minutes"]
+    weekly = hours.get("weekly", DEFAULT_HOURS["weekly"])
+    if not isinstance(weekly, dict):
+        weekly = DEFAULT_HOURS["weekly"]
+    return timezone, slot_minutes, weekly
+
+def parse_hhmm_to_minutes(hhmm: str):
+    hhmm = (hhmm or "").strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", hhmm)
+    if not m:
+        return None
+    h = int(m.group(1))
+    mi = int(m.group(2))
+    if h < 0 or h > 23 or mi < 0 or mi > 59:
+        return None
+    return h * 60 + mi
+
+def normalize_time_to_24h(s: str):
+    s = (s or "").strip()
+    try:
+        t = datetime.datetime.strptime(s, "%H:%M").time()
+        return f"{t.hour:02d}:{t.minute:02d}"
+    except:
+        pass
+    try:
+        t = datetime.datetime.strptime(s, "%I:%M %p").time()
+        return f"{t.hour:02d}:{t.minute:02d}"
+    except:
+        return None
+
+def weekday_key_from_date(date_str: str, tz_name: str):
+    tz = ZoneInfo(tz_name)
+    d = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+    idx = datetime.datetime(d.year, d.month, d.day, 12, 0, tzinfo=tz).weekday()
+    keys = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    return keys[idx]
+
+def is_open_on_date(date_str: str, tz_name: str, weekly: dict):
+    try:
+        day_key = weekday_key_from_date(date_str, tz_name)
+        intervals = weekly.get(day_key, [])
+        return isinstance(intervals, list) and len(intervals) > 0
+    except:
+        return True
+
+def is_time_within_hours(date_str: str, time_24h: str, tz_name: str, weekly: dict):
+    try:
+        day_key = weekday_key_from_date(date_str, tz_name)
+        intervals = weekly.get(day_key, [])
+        if not isinstance(intervals, list) or len(intervals) == 0:
+            return False
+
+        tmin = parse_hhmm_to_minutes(time_24h)
+        if tmin is None:
+            return False
+
+        for it in intervals:
+            if not isinstance(it, dict):
+                continue
+            start = parse_hhmm_to_minutes(it.get("start", ""))
+            end = parse_hhmm_to_minutes(it.get("end", ""))
+            if start is None or end is None:
+                continue
+            if start <= tmin < end:
+                return True
+        return False
+    except:
+        return True
+
+def is_slot_aligned(time_24h: str, slot_minutes: int):
+    tmin = parse_hhmm_to_minutes(time_24h)
+    if tmin is None:
+        return False
+    return (tmin % slot_minutes) == 0
+
+def format_opening_hours_for_day(date_str: str, tz_name: str, weekly: dict):
+    try:
+        day_key = weekday_key_from_date(date_str, tz_name)
+        intervals = weekly.get(day_key, [])
+        if not isinstance(intervals, list) or len(intervals) == 0:
+            return "Closed"
+        parts = []
+        for it in intervals:
+            if isinstance(it, dict) and it.get("start") and it.get("end"):
+                parts.append(f"{it['start']}-{it['end']}")
+        return ", ".join(parts) if parts else "Closed"
+    except:
+        return ""
+
+# -------------------------------------------------
+# State machine
+# -------------------------------------------------
 def get_state_and_draft(clinic_id, user):
     conn = db_conn()
     c = conn.cursor()
@@ -551,7 +660,7 @@ def resolve_clinic_id(to_number: str):
         return None
 
 # -------------------------------------------------
-# Double booking check (DB + Google Sheets)  ✅ uses per-clinic sheet config
+# Double booking check (DB + Google Sheets)
 # -------------------------------------------------
 def check_double_booking(clinic_id, date, time, sheet_id=None, sheet_tab=None):
     conn = db_conn()
@@ -562,7 +671,6 @@ def check_double_booking(clinic_id, date, time, sheet_id=None, sheet_tab=None):
     )
     exists = c.fetchone()
     conn.close()
-
     if exists:
         return True
 
@@ -629,33 +737,17 @@ def looks_like_date(s):
     except:
         return False
 
-def looks_like_time(s):
-    try:
-        datetime.datetime.strptime(s.strip(), "%H:%M")
-        return True
-    except:
-        try:
-            datetime.datetime.strptime(s.strip(), "%I:%M %p")
-            return True
-        except:
-            return False
-
 # -------------------------------------------------
 # AI Reply
 # -------------------------------------------------
 SYSTEM_PROMPT = f"""
 You are a medical clinic receptionist for {CLINIC_NAME}.
 Keep replies short, polite, and helpful.
-
-CRITICAL RULES:
-- Never claim an appointment is booked, confirmed, set, or scheduled.
-- Only confirm appointments after the booking flow asks for date, time, and receives a "yes".
-- If a user wants an appointment, tell them to type "book" to start the booking.
 """
 
 def ai_reply(clinic_id, user, msg):
     if not openai_client:
-        return f"This is {CLINIC_NAME}. Say 'book' to make an appointment."
+        return f"This is {CLINIC_NAME}. Type 'book' to make an appointment."
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages += load_recent_messages(clinic_id, user)
@@ -673,38 +765,49 @@ def ai_reply(clinic_id, user, msg):
         return "Sorry, something went wrong."
 
 # -------------------------------------------------
-# Save appointment (DB-first)
+# Appointment reference code
 # -------------------------------------------------
+def generate_ref_code():
+    alphabet = string.ascii_uppercase + string.digits
+    return "AP-" + "".join(secrets.choice(alphabet) for _ in range(6))
+
 def save_appointment_local(clinic_id, user, name, date, time):
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute(
-        """
-        INSERT INTO appointments (clinic_id, user_number, name, date, time, status, source, created_at, sheet_sync_status)
-        VALUES (%s,%s,%s,%s,%s,'Booked','WhatsApp',%s,'pending')
-        RETURNING id
-        """,
-        (clinic_id, user, name, date, time, datetime.datetime.utcnow())
-    )
-    appt_id = c.fetchone()[0]
-    conn.commit()
-    conn.close()
-    return appt_id
+    """
+    Saves and returns (appt_id, ref_code).
+    Retries ref_code on rare collision.
+    """
+    for _ in range(5):
+        ref_code = generate_ref_code()
+        try:
+            conn = db_conn()
+            c = conn.cursor()
+            c.execute(
+                """
+                INSERT INTO appointments
+                (clinic_id, user_number, name, date, time, status, source, created_at, sheet_sync_status, ref_code)
+                VALUES (%s,%s,%s,%s,%s,'Booked','WhatsApp',%s,'pending',%s)
+                RETURNING id
+                """,
+                (clinic_id, user, name, date, time, datetime.datetime.utcnow(), ref_code)
+            )
+            appt_id = c.fetchone()[0]
+            conn.commit()
+            conn.close()
+            return appt_id, ref_code
+        except psycopg2.Error as e:
+            # 23505 unique violation (ref collision or slot collision)
+            if getattr(e, "pgcode", None) == "23505":
+                try:
+                    conn.close()
+                except:
+                    pass
+                continue
+            raise
+    raise RuntimeError("Failed to generate a unique appointment reference. Try again.")
 
 # -------------------------------------------------
-# Sheets append (returns True/False)  ✅ uses per-clinic sheet config
+# Sheets append
 # -------------------------------------------------
-def col_to_index(col: str) -> int:
-    col = col.strip().upper()
-    return ord(col) - ord("A")
-
-def build_row_from_map(column_map: dict, data: dict) -> list:
-    max_index = max(col_to_index(c) for c in column_map.values())
-    row = [""] * (max_index + 1)
-    for field, col in column_map.items():
-        row[col_to_index(col)] = data.get(field, "")
-    return row
-
 def append_to_sheet(date, time, name, phone, sheet_id=None, sheet_tab=None):
     if not sheets_api:
         return False
@@ -748,26 +851,7 @@ def append_to_sheet(date, time, name, phone, sheet_id=None, sheet_tab=None):
                 return True
 
         # fallback A–F
-        column_map = {
-            "date": "A",
-            "time": "B",
-            "name": "C",
-            "phone": "D",
-            "status": "E",
-            "source": "F",
-        }
-
-        data = {
-            "date": date,
-            "time": time,
-            "name": name,
-            "phone": phone,
-            "status": "Booked",
-            "source": "WhatsApp",
-        }
-
-        row_values = build_row_from_map(column_map, data)
-
+        row_values = [date, time, name, phone, "Booked", "WhatsApp"]
         sheets_api.values().append(
             spreadsheetId=sid,
             range=a1(tab, "A:F"),
@@ -775,7 +859,6 @@ def append_to_sheet(date, time, name, phone, sheet_id=None, sheet_tab=None):
             insertDataOption="INSERT_ROWS",
             body={"values": [row_values]}
         ).execute()
-
         return True
 
     except Exception as e:
@@ -800,7 +883,6 @@ def whatsapp_webhook():
     resp = MessagingResponse()
     msg = resp.message()
 
-    # Resolve clinic_id by Twilio To number
     to_number = request.values.get("To", "").strip()
     clinic_id = resolve_clinic_id(to_number)
     print("Resolved clinic_id:", clinic_id, "To:", to_number)
@@ -809,20 +891,21 @@ def whatsapp_webhook():
         msg.body("This WhatsApp line is not linked to a clinic yet.")
         return Response(str(resp), mimetype="application/xml")
 
-    # ✅ LOAD clinic settings + per-clinic sheet config
     clinic_settings = load_clinic_settings(clinic_id)
     clinic_sheet_id, clinic_sheet_tab = get_clinic_sheet_config(clinic_settings)
+    tz_name, slot_minutes, weekly = get_hours_settings(clinic_settings)
 
-    # ✅ Idempotency: ignore Twilio retries
+    # Idempotency
     twilio_sid = (request.values.get("MessageSid") or "").strip()
     if twilio_sid and already_processed_twilio_sid(twilio_sid):
         msg.body("✅ Received.")
         return Response(str(resp), mimetype="application/xml")
 
-    # Save inbound message with sid
     save_message(clinic_id, user, "user", incoming, twilio_sid=twilio_sid)
 
-    # ✅ ADMIN COMMAND: today
+    # -------------------------
+    # Commands
+    # -------------------------
     if incoming.strip().lower() == "today":
         if not is_admin(user, clinic_settings):
             reply = "Not authorized."
@@ -830,23 +913,19 @@ def whatsapp_webhook():
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        today = datetime.datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
         rows = get_todays_appointments(clinic_id, today)
         if not rows:
             reply = f"No booked appointments for today ({today})."
-            msg.body(reply)
-            save_message(clinic_id, user, "assistant", reply)
-            return Response(str(resp), mimetype="application/xml")
-
-        lines = [f"Today ({today}) appointments:"]
-        for (name, phone, time, sync_status) in rows[:30]:
-            lines.append(f"- {time} | {name} | {phone} | sheets:{sync_status}")
-        reply = "\n".join(lines)
+        else:
+            lines = [f"Today ({today}) appointments:"]
+            for (name, phone, time, sync_status, ref_code) in rows[:30]:
+                lines.append(f"- {time} | {name} | {phone} | ref:{ref_code} | sheets:{sync_status}")
+            reply = "\n".join(lines)
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
-    # ✅ ADMIN COMMAND: retry sheets
     if incoming.strip().lower() == "retry sheets":
         if not is_admin(user, clinic_settings):
             reply = "Not authorized."
@@ -861,10 +940,7 @@ def whatsapp_webhook():
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
-        attempted = 0
-        synced = 0
-        failed = 0
-
+        attempted = synced = failed = 0
         for (appt_id, appt_user, appt_name, appt_date, appt_time, appt_status) in rows:
             attempted += 1
             ok = append_to_sheet(appt_date, appt_time, appt_name, appt_user, clinic_sheet_id, clinic_sheet_tab)
@@ -880,54 +956,67 @@ def whatsapp_webhook():
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
-    # ✅ PATIENT COMMAND: my appointment
     if incoming.strip().lower() == "my appointment":
         appt = get_latest_booked_appointment(clinic_id, user)
         if not appt:
             reply = "You have no booked appointments right now."
         else:
-            appt_id, name, date, time, created_at = appt
-            reply = f"Your next appointment is on {date} at {time} under the name {name}."
+            appt_id, name, date, time, created_at, ref_code = appt
+            reply = f"Your next appointment is on {date} at {time} under the name {name}. Ref: {ref_code}"
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
-    # ✅ PATIENT COMMAND: cancel
+    # cancel by reference: "cancel AP-XXXXXX"
+    m = re.match(r"^cancel\s+(AP-[A-Z0-9]{6})$", incoming.strip().upper())
+    if m:
+        ref_code = m.group(1)
+        result = cancel_by_ref(clinic_id, user, ref_code)
+        if result == "not_owner":
+            reply = "That reference code doesn’t belong to your number."
+        elif not result:
+            reply = "I couldn’t find an active booked appointment with that reference."
+        else:
+            reply = f"✅ Cancelled appointment on {result['date']} at {result['time']}."
+        msg.body(reply)
+        save_message(clinic_id, user, "assistant", reply)
+        return Response(str(resp), mimetype="application/xml")
+
+    # cancel latest
     if incoming.strip().lower() == "cancel":
-        clear_context(clinic_id, user)
         clear_state_machine(clinic_id, user)
         cancelled = cancel_latest_appointment(clinic_id, user)
         if not cancelled:
             reply = "I couldn’t find an active booked appointment to cancel."
         else:
-            reply = f"✅ Cancelled your appointment on {cancelled['date']} at {cancelled['time']}."
+            reply = f"✅ Cancelled your appointment on {cancelled['date']} at {cancelled['time']}. Ref: {cancelled['ref_code']}"
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
-    # ✅ PATIENT COMMAND: reschedule
     if incoming.strip().lower() == "reschedule":
-        clear_context(clinic_id, user)
+        clear_state_machine(clinic_id, user)
         cancelled = cancel_latest_appointment(clinic_id, user)
         set_state_and_draft(clinic_id, user, "collect_name", {})
         if cancelled:
-            reply = f"✅ Cancelled your appointment on {cancelled['date']} at {cancelled['time']}.\nLet’s reschedule. What’s your full name?"
+            reply = f"✅ Cancelled {cancelled['date']} {cancelled['time']} (Ref: {cancelled['ref_code']}).\nLet’s reschedule. What’s your full name?"
         else:
             reply = "No active appointment found, but I can help you book a new one. What’s your full name?"
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
-    # ✅ NEW BOOKING STATE MACHINE
-    state, draft = get_state_and_draft(clinic_id, user)
-
-    if incoming.lower() == "reset":
-        clear_context(clinic_id, user)
+    if incoming.strip().lower() == "reset":
         clear_state_machine(clinic_id, user)
         reply = "Session reset. You can start again."
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
+
+    # -------------------------
+    # Booking state machine
+    # -------------------------
+    state, draft = get_state_and_draft(clinic_id, user)
 
     if state in ["idle", None, ""] and is_booking_intent(incoming):
         set_state_and_draft(clinic_id, user, "collect_name", {})
@@ -946,39 +1035,61 @@ def whatsapp_webhook():
 
     if state == "collect_date":
         if looks_like_date(incoming):
-            draft["date"] = incoming.strip()
-            set_state_and_draft(clinic_id, user, "collect_time", draft)
-            reply = "What time would you prefer? (HH:MM) e.g. 14:00"
-            msg.body(reply)
-            save_message(clinic_id, user, "assistant", reply)
-            return Response(str(resp), mimetype="application/xml")
-        else:
-            reply = "Please type the date like 2026-01-15 (YYYY-MM-DD)."
-            msg.body(reply)
-            save_message(clinic_id, user, "assistant", reply)
-            return Response(str(resp), mimetype="application/xml")
+            date_str = incoming.strip()
 
-    if state == "collect_time":
-        if looks_like_time(incoming):
-            date = draft.get("date", "")
-            time = incoming.strip()
-            if check_double_booking(clinic_id, date, time, clinic_sheet_id, clinic_sheet_tab):
-                reply = "That slot is already booked. Choose another time."
+            if not is_open_on_date(date_str, tz_name, weekly):
+                reply = "Sorry, we’re closed on that day. Please choose another date."
                 msg.body(reply)
                 save_message(clinic_id, user, "assistant", reply)
                 return Response(str(resp), mimetype="application/xml")
 
-            draft["time"] = time
-            set_state_and_draft(clinic_id, user, "confirm", draft)
-            reply = f"Confirm appointment on {date} at {time}? (yes/no)"
+            draft["date"] = date_str
+            set_state_and_draft(clinic_id, user, "collect_time", draft)
+            reply = f"What time would you prefer? (HH:MM) e.g. 14:00. Slots are {slot_minutes} minutes."
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
-        else:
-            reply = "Please type the time like 09:30 (HH:MM) e.g. 14:00."
+
+        reply = "Please type the date like 2026-01-15 (YYYY-MM-DD)."
+        msg.body(reply)
+        save_message(clinic_id, user, "assistant", reply)
+        return Response(str(resp), mimetype="application/xml")
+
+    if state == "collect_time":
+        time_24 = normalize_time_to_24h(incoming)
+        if not time_24:
+            reply = "Please type the time like 09:30 (HH:MM) or 2:30 PM."
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
+
+        date = draft.get("date", "")
+
+        if not is_time_within_hours(date, time_24, tz_name, weekly):
+            hours_str = format_opening_hours_for_day(date, tz_name, weekly)
+            reply = f"That time is outside working hours for {date}. Available: {hours_str}."
+            msg.body(reply)
+            save_message(clinic_id, user, "assistant", reply)
+            return Response(str(resp), mimetype="application/xml")
+
+        if not is_slot_aligned(time_24, slot_minutes):
+            reply = f"Please choose a time that matches our {slot_minutes}-minute slots (e.g. 09:00, 09:30, 10:00)."
+            msg.body(reply)
+            save_message(clinic_id, user, "assistant", reply)
+            return Response(str(resp), mimetype="application/xml")
+
+        if check_double_booking(clinic_id, date, time_24, clinic_sheet_id, clinic_sheet_tab):
+            reply = "That slot is already booked. Choose another time."
+            msg.body(reply)
+            save_message(clinic_id, user, "assistant", reply)
+            return Response(str(resp), mimetype="application/xml")
+
+        draft["time"] = time_24
+        set_state_and_draft(clinic_id, user, "confirm", draft)
+        reply = f"Confirm appointment on {date} at {time_24}? (yes/no)"
+        msg.body(reply)
+        save_message(clinic_id, user, "assistant", reply)
+        return Response(str(resp), mimetype="application/xml")
 
     if state == "confirm":
         if incoming.lower() in ["yes", "y"]:
@@ -986,16 +1097,8 @@ def whatsapp_webhook():
             date = draft.get("date", "").strip()
             time = draft.get("time", "").strip()
 
-            try:
-                appt_id = save_appointment_local(clinic_id, user, name, date, time)
-            except psycopg2.Error as e:
-                if getattr(e, "pgcode", None) == "23505":
-                    reply = "That slot is already booked. Choose another time."
-                    msg.body(reply)
-                    save_message(clinic_id, user, "assistant", reply)
-                    set_state_and_draft(clinic_id, user, "collect_time", {"name": name, "date": date})
-                    return Response(str(resp), mimetype="application/xml")
-                raise
+            # Save to DB + get ref
+            appt_id, ref_code = save_appointment_local(clinic_id, user, name, date, time)
 
             ok = append_to_sheet(date, time, name, user, clinic_sheet_id, clinic_sheet_tab)
             if ok:
@@ -1005,7 +1108,7 @@ def whatsapp_webhook():
 
             clear_state_machine(clinic_id, user)
 
-            reply = f"✅ Appointment confirmed for {date} at {time}"
+            reply = f"✅ Appointment confirmed for {date} at {time}\nRef: {ref_code}\nTo cancel: cancel {ref_code}"
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
@@ -1022,6 +1125,7 @@ def whatsapp_webhook():
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
+    # Safety nudge
     maybe_booking_words = ["dent", "tooth", "teeth", "pain", "ache", "clean", "check", "braces", "gum"]
     if any(w in incoming.lower() for w in maybe_booking_words):
         reply = "If you'd like to book an appointment, please type 'book'."
@@ -1029,6 +1133,7 @@ def whatsapp_webhook():
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
 
+    # Otherwise AI
     reply = ai_reply(clinic_id, user, incoming)
     msg.body(reply)
     save_message(clinic_id, user, "assistant", reply)
@@ -1041,4 +1146,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting {CLINIC_NAME} bot on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
+
 

@@ -75,6 +75,34 @@ def init_db():
         )
     """)
 
+    # -------------------------------------------------
+    # JOB QUEUE (Postgres-backed)
+    # -------------------------------------------------
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            id BIGSERIAL PRIMARY KEY,
+            job_type TEXT NOT NULL,
+            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+            status TEXT NOT NULL DEFAULT 'queued',   -- queued, running, done, failed
+            run_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            attempts INT NOT NULL DEFAULT 0,
+            max_attempts INT NOT NULL DEFAULT 8,
+            last_error TEXT,
+            locked_at TIMESTAMPTZ,
+            locked_by TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+
+    try:
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_jobs_status_runat
+            ON jobs(status, run_at)
+        """)
+    except Exception as e:
+        print("Index create idx_jobs_status_runat failed:", repr(e))
+
     conn.commit()
     conn.close()
     print("DB tables checked/created successfully")

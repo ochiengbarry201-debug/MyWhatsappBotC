@@ -28,6 +28,7 @@ from hours import (
 )
 from intents import is_booking_intent, looks_like_date
 from sheets import append_to_sheet
+from jobs import enqueue_job   # ✅ NEW (only addition)
 
 def register_routes(app):
 
@@ -258,11 +259,16 @@ def register_routes(app):
 
                 appt_id, ref_code = save_appointment_local(clinic_id, user, name, date, time)
 
-                ok = append_to_sheet(date, time, name, user, clinic_sheet_id, clinic_sheet_tab)
-                if ok:
-                    update_sheet_sync_status(appt_id, "synced")
-                else:
-                    update_sheet_sync_status(appt_id, "failed", "Sheets append failed (see logs)")
+                # ✅ QUEUED instead of inline Sheets sync
+                enqueue_job("sync_sheet", {
+                    "appointment_id": appt_id,
+                    "date": date,
+                    "time": time,
+                    "name": name,
+                    "phone": user,
+                    "sheet_id": clinic_sheet_id,
+                    "sheet_tab": clinic_sheet_tab
+                })
 
                 clear_state_machine(clinic_id, user)
 

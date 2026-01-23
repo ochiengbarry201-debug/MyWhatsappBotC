@@ -108,6 +108,9 @@ def reschedule_or_fail(job_id: int, attempts: int, max_attempts: int, error: str
             attempts=%s,
             last_error=%s,
             run_at=%s,
+            locked_at=NULL,
+            locked_by=NULL,
+
             updated_at=now()
         WHERE id=%s
         """,

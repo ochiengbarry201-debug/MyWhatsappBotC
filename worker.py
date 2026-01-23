@@ -23,13 +23,20 @@ def handle_job(job):
         sheet_id = payload.get("sheet_id")
         sheet_tab = payload.get("sheet_tab")
 
-        ok = append_to_sheet(date, time_, name, phone, sheet_id, sheet_tab)
+        # ✅ PATCH: expose the REAL reason Sheets fails
+        try:
+            ok = append_to_sheet(date, time_, name, phone, sheet_id, sheet_tab)
+        except Exception as e:
+            update_sheet_sync_status(appointment_id, "failed", f"Sheets exception: {repr(e)}")
+            raise  # bubbles up so jobs.last_error captures traceback
+
         if ok:
             update_sheet_sync_status(appointment_id, "synced")
             return True
         else:
-            update_sheet_sync_status(appointment_id, "failed", "Worker sheets append failed (see logs)")
-            return False
+            # If append_to_sheet returns False without throwing, force a real error
+            update_sheet_sync_status(appointment_id, "failed", "Sheets append returned False (check worker logs)")
+            raise RuntimeError("Sheets append returned False")
 
     print("Unknown job_type:", job_type, "job_id:", job["id"])
     return True
@@ -106,6 +113,7 @@ def main():
                 if ok:
                     mark_done(job["id"])
                 else:
+                    # With the patch, handle_job won't return False for sync_sheet.
                     reschedule_or_fail(
                         job["id"],
                         job.get("attempts", 0),

@@ -6,7 +6,6 @@ from sheets import append_to_sheet
 from db import db_conn, update_sheet_sync_status, load_clinic_settings
 from clinic import get_clinic_sheet_config
 
-
 SWEEP_EVERY_SECONDS = 120
 SWEEP_LIMIT = 50
 
@@ -32,7 +31,6 @@ def handle_job(job):
             update_sheet_sync_status(appointment_id, "failed", "Worker sheets append failed (see logs)")
             return False
 
-    # Unknown job types: mark done so it doesn't loop forever
     print("Unknown job_type:", job_type, "job_id:", job["id"])
     return True
 
@@ -62,7 +60,6 @@ def sweep_and_enqueue_unsynced():
     skipped = 0
 
     for (appt_id, clinic_id, user_number, name, date, time_, sync_status) in rows:
-        # Avoid spamming duplicates
         if has_pending_sync_job(appt_id):
             skipped += 1
             continue
@@ -90,7 +87,6 @@ def main():
     last_sweep = 0
 
     while True:
-        # Periodic sweeper
         now = time.time()
         if now - last_sweep >= SWEEP_EVERY_SECONDS:
             try:
@@ -99,7 +95,6 @@ def main():
                 print("[SWEEP] failed:", repr(e))
             last_sweep = now
 
-        # Normal job processing
         jobs = fetch_and_lock_jobs(limit=5)
         if not jobs:
             time.sleep(2)
@@ -130,4 +125,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

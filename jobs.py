@@ -63,7 +63,14 @@ def mark_done(job_id: int):
     conn = db_conn()
     c = conn.cursor()
     c.execute(
-        "UPDATE jobs SET status='done', updated_at=now() WHERE id=%s",
+        """
+        UPDATE jobs
+        SET status='done',
+            locked_at=NULL,
+            locked_by=NULL,
+            updated_at=now()
+        WHERE id=%s
+        """,
         (job_id,)
     )
     conn.commit()
@@ -110,7 +117,6 @@ def reschedule_or_fail(job_id: int, attempts: int, max_attempts: int, error: str
             run_at=%s,
             locked_at=NULL,
             locked_by=NULL,
-
             updated_at=now()
         WHERE id=%s
         """,

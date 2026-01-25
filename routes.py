@@ -28,7 +28,10 @@ from hours import (
 )
 from intents import is_booking_intent, looks_like_date
 from sheets import append_to_sheet
-from jobs import enqueue_job   # ✅ NEW (only addition)
+
+# ✅ NEW: job status helpers
+from jobs import get_job_counts, count_stale_running_jobs, list_failed_jobs
+
 
 def register_routes(app):
 
@@ -114,6 +117,58 @@ def register_routes(app):
                     update_sheet_sync_status(appt_id, "failed", "Retry sheets failed (see logs)")
 
             reply = f"Retry complete ✅\nAttempted: {attempted}\nSynced: {synced}\nFailed: {failed}"
+            msg.body(reply)
+            save_message(clinic_id, user, "assistant", reply)
+            return Response(str(resp), mimetype="application/xml")
+
+        # ✅ NEW ADMIN COMMAND: "jobs"
+        if incoming.strip().lower() == "jobs":
+            if not is_admin(user, clinic_settings):
+                reply = "Not authorized."
+                msg.body(reply)
+                save_message(clinic_id, user, "assistant", reply)
+                return Response(str(resp), mimetype="application/xml")
+
+            all_counts = get_job_counts()
+            sheet_counts = get_job_counts("sync_sheet")
+            stale_all = count_stale_running_jobs(minutes=5)
+            stale_sheet = count_stale_running_jobs(minutes=5, job_type="sync_sheet")
+
+            def fmt_counts(d):
+                return f"queued:{d.get('queued',0)} running:{d.get('running',0)} done:{d.get('done',0)} failed:{d.get('failed',0)}"
+
+            reply = (
+                "Job status ✅\n"
+                f"All jobs -> {fmt_counts(all_counts)} | stale_running(>5m): {stale_all}\n"
+                f"sync_sheet -> {fmt_counts(sheet_counts)} | stale_running(>5m): {stale_sheet}\n"
+                "Commands: jobs, failed jobs"
+            )
+            msg.body(reply)
+            save_message(clinic_id, user, "assistant", reply)
+            return Response(str(resp), mimetype="application/xml")
+
+        # ✅ NEW ADMIN COMMAND: "failed jobs"
+        if incoming.strip().lower() in ["failed jobs", "jobs failed"]:
+            if not is_admin(user, clinic_settings):
+                reply = "Not authorized."
+                msg.body(reply)
+                save_message(clinic_id, user, "assistant", reply)
+                return Response(str(resp), mimetype="application/xml")
+
+            rows = list_failed_jobs(job_type="sync_sheet", limit=10)
+            if not rows:
+                reply = "No failed sync_sheet jobs ✅"
+            else:
+                lines = ["Failed sync_sheet jobs (latest 10):"]
+                for r in rows:
+                    jid = r.get("id")
+                    att = r.get("attempts")
+                    mx = r.get("max_attempts")
+                    err = (r.get("last_error") or "").replace("\n", " ")
+                    err = (err[:120] + "…") if len(err) > 120 else err
+                    lines.append(f"- id:{jid} attempts:{att}/{mx} err:{err}")
+                reply = "\n".join(lines)
+
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
@@ -255,24 +310,19 @@ def register_routes(app):
             if incoming.lower() in ["yes", "y"]:
                 name = draft.get("name", "").strip()
                 date = draft.get("date", "").strip()
-                time = draft.get("time", "").strip()
+                time_ = draft.get("time", "").strip()
 
-                appt_id, ref_code = save_appointment_local(clinic_id, user, name, date, time)
+                appt_id, ref_code = save_appointment_local(clinic_id, user, name, date, time_)
 
-                # ✅ QUEUED instead of inline Sheets sync
-                enqueue_job("sync_sheet", {
-                    "appointment_id": appt_id,
-                    "date": date,
-                    "time": time,
-                    "name": name,
-                    "phone": user,
-                    "sheet_id": clinic_sheet_id,
-                    "sheet_tab": clinic_sheet_tab
-                })
+                ok = append_to_sheet(date, time_, name, user, clinic_sheet_id, clinic_sheet_tab)
+                if ok:
+                    update_sheet_sync_status(appt_id, "synced")
+                else:
+                    update_sheet_sync_status(appt_id, "failed", "Sheets append failed (see logs)")
 
                 clear_state_machine(clinic_id, user)
 
-                reply = f"✅ Appointment confirmed for {date} at {time}\nRef: {ref_code}\nTo cancel: cancel {ref_code}"
+                reply = f"✅ Appointment confirmed for {date} at {time_}\nRef: {ref_code}\nTo cancel: cancel {ref_code}"
                 msg.body(reply)
                 save_message(clinic_id, user, "assistant", reply)
                 return Response(str(resp), mimetype="application/xml")
@@ -300,3 +350,4 @@ def register_routes(app):
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
+

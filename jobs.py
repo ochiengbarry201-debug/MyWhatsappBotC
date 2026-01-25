@@ -187,3 +187,112 @@ def cancel_jobs_for_appointment(job_type: str, appointment_id: int):
     )
     conn.commit()
     conn.close()
+
+
+# ============================================================
+# ✅ PATCH: Job status helpers required by routes.py imports
+#     routes.py imports:
+#       get_job_counts, count_stale_running_jobs, list_failed_jobs
+# ============================================================
+
+def get_job_counts(job_type=None):
+    """
+    Returns counts grouped by status.
+    If job_type is provided, filters to that job_type.
+    """
+    conn = db_conn()
+    c = conn.cursor()
+    if job_type:
+        c.execute(
+            """
+            SELECT status, COUNT(*)
+            FROM jobs
+            WHERE job_type=%s
+            GROUP BY status
+            """,
+            (job_type,)
+        )
+    else:
+        c.execute(
+            """
+            SELECT status, COUNT(*)
+            FROM jobs
+            GROUP BY status
+            """
+        )
+    rows = c.fetchall()
+    conn.close()
+    return {status: count for status, count in rows}
+
+
+def count_stale_running_jobs(minutes=5, job_type=None):
+    """
+    Counts running jobs whose locked_at is older than N minutes.
+    """
+    conn = db_conn()
+    c = conn.cursor()
+    interval = f"{int(minutes)} minutes"
+
+    if job_type:
+        c.execute(
+            """
+            SELECT COUNT(*)
+            FROM jobs
+            WHERE status='running'
+              AND job_type=%s
+              AND locked_at IS NOT NULL
+              AND locked_at < now() - (%s)::interval
+            """,
+            (job_type, interval)
+        )
+    else:
+        c.execute(
+            """
+            SELECT COUNT(*)
+            FROM jobs
+            WHERE status='running'
+              AND locked_at IS NOT NULL
+              AND locked_at < now() - (%s)::interval
+            """,
+            (interval,)
+        )
+
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
+
+def list_failed_jobs(job_type=None, limit=10):
+    """
+    Returns latest failed jobs (optionally filtered by job_type).
+    """
+    conn = db_conn()
+    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    if job_type:
+        c.execute(
+            """
+            SELECT *
+            FROM jobs
+            WHERE status='failed'
+              AND job_type=%s
+            ORDER BY updated_at DESC, id DESC
+            LIMIT %s
+            """,
+            (job_type, int(limit))
+        )
+    else:
+        c.execute(
+            """
+            SELECT *
+            FROM jobs
+            WHERE status='failed'
+            ORDER BY updated_at DESC, id DESC
+            LIMIT %s
+            """,
+            (int(limit),)
+        )
+
+    rows = c.fetchall()
+    conn.close()
+    return rows

@@ -2,9 +2,12 @@ import time
 import traceback
 
 from jobs import fetch_and_lock_jobs, mark_done, reschedule_or_fail, enqueue_job, has_pending_sync_job
-from sheets import init_sheets, append_to_sheet
+from sheets import append_to_sheet
 from db import db_conn, update_sheet_sync_status, load_clinic_settings
 from clinic import get_clinic_sheet_config
+
+# ✅ NEW: Twilio sender (for notify_admin + patient_reminder jobs)
+from notifier import send_whatsapp
 
 SWEEP_EVERY_SECONDS = 120
 SWEEP_LIMIT = 50
@@ -37,6 +40,20 @@ def handle_job(job):
             # If append_to_sheet returns False without throwing, force a real error
             update_sheet_sync_status(appointment_id, "failed", "Sheets append returned False (check worker logs)")
             raise RuntimeError("Sheets append returned False")
+
+    # ✅ NEW: notify admins when booked/cancelled/rescheduled
+    if job_type == "notify_admin":
+        to_number = payload.get("to")
+        body = payload.get("body", "")
+        send_whatsapp(to_number, body)
+        return True
+
+    # ✅ NEW: patient reminder job (scheduled run_at in jobs table)
+    if job_type == "patient_reminder":
+        to_number = payload.get("to")
+        body = payload.get("body", "")
+        send_whatsapp(to_number, body)
+        return True
 
     print("Unknown job_type:", job_type, "job_id:", job["id"])
     return True
@@ -91,12 +108,6 @@ def sweep_and_enqueue_unsynced():
 
 def main():
     print("Worker started ✅ (with auto-retry sweeper)")
-
-    # ✅ NEW: initialize Google Sheets client in the worker process
-    print("Initializing Google Sheets in worker…")
-    init_sheets()
-    print("Google Sheets initialized ✅")
-
     last_sweep = 0
 
     while True:

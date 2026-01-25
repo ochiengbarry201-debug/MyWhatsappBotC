@@ -103,7 +103,7 @@ def reschedule_or_fail(job_id: int, attempts: int, max_attempts: int, error: str
         conn.close()
         return
 
-    delay = 30 * (2 ** (attempts - 1))  # 30s, 60s, 120s...
+    delay = 30 * (2 ** (attempts - 1))
     run_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=delay)
 
     conn = db_conn()
@@ -126,7 +126,6 @@ def reschedule_or_fail(job_id: int, attempts: int, max_attempts: int, error: str
     conn.close()
 
 
-# ✅ NEW: prevent duplicate retries for the same appointment
 def has_pending_sync_job(appointment_id: int) -> bool:
     """
     Returns True if there's already a queued/running sync_sheet job for this appointment_id.
@@ -147,3 +146,44 @@ def has_pending_sync_job(appointment_id: int) -> bool:
     exists = c.fetchone() is not None
     conn.close()
     return exists
+
+
+# ✅ NEW: generic pending-job check for appointment-based jobs (reminders, etc.)
+def has_pending_job_for_appointment(job_type: str, appointment_id: int) -> bool:
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT 1
+        FROM jobs
+        WHERE job_type=%s
+          AND status IN ('queued','running')
+          AND (payload->>'appointment_id')::text = %s
+        LIMIT 1
+        """,
+        (job_type, str(appointment_id))
+    )
+    exists = c.fetchone() is not None
+    conn.close()
+    return exists
+
+
+# ✅ NEW: cancel queued/running jobs tied to an appointment (e.g., reminders)
+def cancel_jobs_for_appointment(job_type: str, appointment_id: int):
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        UPDATE jobs
+        SET status='cancelled',
+            locked_at=NULL,
+            locked_by=NULL,
+            updated_at=now()
+        WHERE job_type=%s
+          AND status IN ('queued','running')
+          AND (payload->>'appointment_id')::text = %s
+        """,
+        (job_type, str(appointment_id))
+    )
+    conn.commit()
+    conn.close()

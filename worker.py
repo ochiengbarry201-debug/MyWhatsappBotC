@@ -2,7 +2,7 @@ import time
 import traceback
 
 from jobs import fetch_and_lock_jobs, mark_done, reschedule_or_fail, enqueue_job, has_pending_sync_job
-from sheets import append_to_sheet
+from sheets import init_sheets, append_to_sheet
 from db import db_conn, update_sheet_sync_status, load_clinic_settings
 from clinic import get_clinic_sheet_config
 
@@ -91,6 +91,12 @@ def sweep_and_enqueue_unsynced():
 
 def main():
     print("Worker started ✅ (with auto-retry sweeper)")
+
+    # ✅ NEW: initialize Google Sheets client in the worker process
+    print("Initializing Google Sheets in worker…")
+    init_sheets()
+    print("Google Sheets initialized ✅")
+
     last_sweep = 0
 
     while True:

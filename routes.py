@@ -549,3 +549,4 @@ def register_routes(app):
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
+

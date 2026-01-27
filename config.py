@@ -28,7 +28,7 @@ DEFAULT_SHEET_TAB = "Sheet1"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
 ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "").strip()
-CLINIC_NAME = os.getenv("CLINIC_NAME", "PrimeCare Medical Centre")
+CLINIC_NAME = os.getenv("CLINIC_NAME", "PrimeCare Dental Clinic")
 
 # -------------------------------------------------
 # Database (PostgreSQL ONLY)

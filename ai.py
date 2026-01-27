@@ -2,12 +2,8 @@ from openai import OpenAI
 from config import OPENAI_API_KEY, CLINIC_NAME
 from db import load_recent_messages
 
-SYSTEM_PROMPT = f"""
-You are a medical clinic receptionist for {CLINIC_NAME}.
-Keep replies short, polite, and helpful.
-"""
-
 openai_client = None
+
 
 def init_ai():
     global openai_client
@@ -20,11 +16,41 @@ def init_ai():
     else:
         print("Warning: OPENAI_API_KEY not set — AI replies disabled")
 
-def ai_reply(clinic_id, user, msg):
-    if not openai_client:
-        return f"This is {CLINIC_NAME}. Type 'book' to make an appointment."
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+def _build_system_prompt(clinic: dict):
+    clinic_name = clinic.get("name") or CLINIC_NAME
+
+    return f"""
+You are a polite, professional, and friendly dental clinic receptionist for {clinic_name}.
+
+Guidelines:
+- Greet patients warmly and naturally
+- Answer general dental questions clearly and simply
+- Be empathetic if someone mentions pain or discomfort
+- Do NOT diagnose or give medical treatment advice
+- Encourage booking politely when appropriate, but do not force it
+- Keep responses human, calm, and helpful (not robotic)
+
+If the patient wants to book:
+- Ask for their full name
+- Ask for preferred date
+- Ask for preferred time
+- Confirm before booking
+""".strip()
+
+
+def ai_reply(clinic: dict, user: str, msg: str):
+    clinic_id = clinic.get("id")
+    clinic_name = clinic.get("name") or CLINIC_NAME
+
+    if not openai_client:
+        return f"This is {clinic_name}. How may we help you today?"
+
+    messages = [
+        {"role": "system", "content": _build_system_prompt(clinic)}
+    ]
+
+    # Keep conversation memory EXACTLY as before
     messages += load_recent_messages(clinic_id, user)
     messages.append({"role": "user", "content": msg})
 
@@ -32,9 +58,10 @@ def ai_reply(clinic_id, user, msg):
         res = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            max_tokens=200
+            max_tokens=250,
+            temperature=0.6
         )
         return res.choices[0].message.content.strip()
     except Exception as e:
         print("AI error:", repr(e))
-        return "Sorry, something went wrong."
+        return "Sorry, something went wrong. Please try again."

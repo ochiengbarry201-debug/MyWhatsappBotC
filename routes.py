@@ -506,14 +506,17 @@ def register_routes(app):
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
-        maybe_booking_words = ["dent", "tooth", "teeth", "pain", "ache", "clean", "check", "braces", "gum"]
-        if any(w in incoming.lower() for w in maybe_booking_words):
-            reply = "If you'd like to book an appointment, please type 'book'."
-            msg.body(reply)
-            save_message(clinic_id, user, "assistant", reply)
-            return Response(str(resp), mimetype="application/xml")
+        # ✅ CHANGE 1: remove forced booking prompt for dental keywords
+        # (deleted block that was here)
 
-        reply = ai_reply(clinic_id, user, incoming)
+        # ✅ CHANGE 2: ai.py updated expects a clinic dict
+        clinic = {
+            "id": clinic_id,
+            "name": clinic_settings.get("name", "PrimeCare Dental Clinic"),
+            "timezone": tz_name
+        }
+
+        reply = ai_reply(clinic, user, incoming)
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")

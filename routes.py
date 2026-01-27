@@ -42,6 +42,28 @@ from jobs import enqueue_job, cancel_jobs_for_appointment
 REMINDER_MINUTES_BEFORE = 120  # 2 hours before appointment
 
 
+def _is_greeting(text: str) -> bool:
+    """
+    Broad greeting detector for first-contact welcome.
+    Keeps logic simple & scale-friendly.
+    """
+    if not text:
+        return False
+
+    t = text.lower().strip()
+
+    greetings = [
+        "hi", "hello", "hey", "yo",
+        "good morning", "morning",
+        "good afternoon", "afternoon",
+        "good evening", "evening",
+        "good day",
+        "habari", "niaje", "sasa", "mambo"
+    ]
+
+    return any(g in t for g in greetings)
+
+
 def _safe_admin_numbers(clinic_settings: dict):
     """
     Reads admin numbers from clinic settings:
@@ -378,6 +400,13 @@ def register_routes(app):
         # Booking state machine
         # -------------------------
         state, draft = get_state_and_draft(clinic_id, user)
+
+        if state in [None, "", "idle"] and _is_greeting(incoming):
+            clinic_name = clinic_settings.get("name", "PrimeCare Dental Clinic")
+            reply = f"Hello 👋 Welcome to {clinic_name}. How may we help you today?"
+            msg.body(reply)
+            save_message(clinic_id, user, "assistant", reply)
+            return Response(str(resp), mimetype="application/xml")
 
         if state in ["idle", None, ""] and is_booking_intent(incoming):
             set_state_and_draft(clinic_id, user, "collect_name", {})

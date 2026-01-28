@@ -6,7 +6,7 @@ from flask import request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 
 from admin import is_admin
-from ai import ai_reply
+from ai import ai_reply, OFFER_BOOKING_MARKER  # ✅ marker import (ONLY CHANGE)
 from booking import check_double_booking, save_appointment_local
 from clinic import resolve_clinic_id, get_clinic_sheet_config
 from db import (
@@ -45,6 +45,7 @@ REMINDER_MINUTES_BEFORE = 120  # 2 hours before appointment
 def _is_greeting(text: str) -> bool:
     """
     Broad greeting detector for first-contact welcome.
+    IMPORTANT: Avoid substring matches like 'hi' inside 'this'.
     Keeps logic simple & scale-friendly.
     """
     if not text:
@@ -52,16 +53,76 @@ def _is_greeting(text: str) -> bool:
 
     t = text.lower().strip()
 
-    greetings = [
-        "hi", "hello", "hey", "yo",
-        "good morning", "morning",
-        "good afternoon", "afternoon",
-        "good evening", "evening",
-        "good day",
-        "habari", "niaje", "sasa", "mambo"
+    # Normalize punctuation to spaces so word/phrase checks behave well
+    t_norm = re.sub(r"[^a-z0-9\s]", " ", t)
+    t_norm = re.sub(r"\s+", " ", t_norm).strip()
+
+    # Greetings are usually short; prevents weird mid-convo triggers
+    if len(t_norm) > 30:
+        return False
+
+    # Phrase greetings (match full message)
+    phrases = {
+        "good morning", "good afternoon", "good evening", "good day",
+        "morning", "afternoon", "evening",
+        "habari", "niaje", "sasa", "mambo",
+        "goodmorning", "goodafternoon", "goodevening"  # no-space variants
+    }
+    if t_norm in phrases:
+        return True
+
+    # Single-word greetings (match whole words only)
+    words = set(t_norm.split())
+    single_words = {"hi", "hello", "hey", "yo"}
+
+    # Keep it tight: only trigger on short, greeting-like messages
+    if len(words) <= 3 and not any(ch.isdigit() for ch in t_norm) and (words & single_words):
+        return True
+
+    return False
+
+
+def _looks_like_booking_agree(text: str) -> bool:
+    """
+    Broad 'yes / proceed / help me book' detector.
+    Not locked to exact words; uses intent-ish signals.
+    """
+    if not text:
+        return False
+
+    t = text.lower().strip()
+    t_norm = re.sub(r"[^a-z0-9\s]", " ", t)
+    t_norm = re.sub(r"\s+", " ", t_norm).strip()
+
+    # Positive/proceed signals (broad)
+    positive = [
+        "yes", "yeah", "yep", "sure", "okay", "ok", "alright", "proceed", "go ahead",
+        "please", "kindly", "sounds good", "that works", "i would", "i want", "i need",
+        "help me", "can you", "could you"
     ]
 
-    return any(g in t for g in greetings)
+    # Booking-ish signals
+    bookingish = [
+        "book", "booking", "appointment", "schedule", "reschedule", "visit", "come in",
+        "see dentist", "see the dentist", "consultation", "checkup", "check-up"
+    ]
+
+    return any(p in t_norm for p in positive) or any(b in t_norm for b in bookingish)
+
+
+def _looks_like_booking_decline(text: str) -> bool:
+    if not text:
+        return False
+
+    t = text.lower().strip()
+    t_norm = re.sub(r"[^a-z0-9\s]", " ", t)
+    t_norm = re.sub(r"\s+", " ", t_norm).strip()
+
+    decline = [
+        "no", "nope", "not now", "later", "maybe later", "another time",
+        "not today", "no thanks", "dont", "do not", "just asking"
+    ]
+    return any(d in t_norm for d in decline)
 
 
 def _safe_admin_numbers(clinic_settings: dict):
@@ -408,6 +469,25 @@ def register_routes(app):
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
+        # ✅ NEW: If AI suggested booking, we catch the next reply here (broadly)
+        if state == "offer_booking":
+            if _looks_like_booking_agree(incoming):
+                set_state_and_draft(clinic_id, user, "collect_name", {})
+                reply = "Great — what’s your full name?"
+                msg.body(reply)
+                save_message(clinic_id, user, "assistant", reply)
+                return Response(str(resp), mimetype="application/xml")
+
+            if _looks_like_booking_decline(incoming):
+                clear_state_machine(clinic_id, user)
+                # fall through to AI below
+
+            else:
+                reply = "No problem. Would you like me to help you book an appointment? (yes/no)"
+                msg.body(reply)
+                save_message(clinic_id, user, "assistant", reply)
+                return Response(str(resp), mimetype="application/xml")
+
         if state in ["idle", None, ""] and is_booking_intent(incoming):
             set_state_and_draft(clinic_id, user, "collect_name", {})
             reply = "Sure. What's your full name?"
@@ -440,7 +520,7 @@ def register_routes(app):
                 save_message(clinic_id, user, "assistant", reply)
                 return Response(str(resp), mimetype="application/xml")
 
-            reply = "Please type the date like 2026-01-15 (YYYY-MM-DD)."
+            reply = "Please confirm the date in this format: YYYY-MM-DD (example: 2026-01-30)."
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
@@ -546,7 +626,15 @@ def register_routes(app):
         }
 
         reply = ai_reply(clinic, user, incoming)
+
+        # ✅ MARKER CHANGE (ONLY CHANGE):
+        # If AI suggests booking, set a short-lived state to interpret next reply naturally.
+        # Also ensure marker never reaches the patient.
+        if OFFER_BOOKING_MARKER in reply:
+            reply = reply.replace(OFFER_BOOKING_MARKER, "").strip()
+            if state in ["idle", None, ""]:
+                set_state_and_draft(clinic_id, user, "offer_booking", {})
+
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)
         return Response(str(resp), mimetype="application/xml")
-

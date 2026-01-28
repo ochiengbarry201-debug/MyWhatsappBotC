@@ -2,6 +2,9 @@ from openai import OpenAI
 from config import OPENAI_API_KEY, CLINIC_NAME
 from db import load_recent_messages
 
+# ✅ Marker that routes.py will detect and remove before sending to the user
+OFFER_BOOKING_MARKER = "<<OFFER_BOOKING>>"
+
 openai_client = None
 
 
@@ -30,6 +33,12 @@ Guidelines:
 - Do NOT diagnose or give medical treatment advice
 - Encourage booking politely when appropriate, but do not force it
 - Keep responses human, calm, and helpful (not robotic)
+
+Booking handoff rule (IMPORTANT):
+- If you are offering to help the patient book an appointment, include the exact marker {OFFER_BOOKING_MARKER} anywhere in your reply.
+- Only include it when you are explicitly asking if they want to book / want help booking.
+- Do NOT explain the marker.
+- Do NOT include it for general dental Q&A.
 
 If the patient wants to book:
 - Ask for their full name
@@ -65,3 +74,5 @@ def ai_reply(clinic: dict, user: str, msg: str):
     except Exception as e:
         print("AI error:", repr(e))
         return "Sorry, something went wrong. Please try again."
+
+

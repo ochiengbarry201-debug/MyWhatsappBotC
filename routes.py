@@ -6,7 +6,7 @@ from flask import request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 
 from admin import is_admin
-from ai import ai_reply, OFFER_BOOKING_MARKER  # ✅ marker import (ONLY CHANGE)
+from ai import ai_reply
 from booking import check_double_booking, save_appointment_local
 from clinic import resolve_clinic_id, get_clinic_sheet_config
 from db import (
@@ -26,8 +26,10 @@ from hours import (
     is_slot_aligned,
     format_opening_hours_for_day,
 )
-from intents import is_booking_intent, looks_like_date
-from sheets import append_to_sheet
+from intents import is_booking_intent, looks_like_date, is_cancel_intent, is_reschedule_intent
+
+# ✅ PATCH: import REF + status update helpers (leaves existing append_to_sheet intact)
+from sheets import append_to_sheet, append_ref_to_latest_row, update_sheet_status_by_ref
 
 # ✅ job status helpers
 from jobs import get_job_counts, count_stale_running_jobs, list_failed_jobs
@@ -372,8 +374,12 @@ def register_routes(app):
                 save_message(clinic_id, user, "assistant", reply)
                 return Response(str(resp), mimetype="application/xml")
 
-            # ✅ cancel reminder jobs tied to this appointment (if your cancel_by_ref returns id)
-            # If your cancel_by_ref doesn't return appointment_id, we still notify admins.
+            # ✅ PATCH: update Sheets status by REF
+            try:
+                update_sheet_status_by_ref(ref_code, "Cancelled", clinic_sheet_id, clinic_sheet_tab)
+            except Exception as e:
+                print("Sheets cancel(ref) update failed:", repr(e))
+
             reply = f"✅ Cancelled appointment on {result['date']} at {result['time']}."
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
@@ -397,11 +403,16 @@ def register_routes(app):
                 save_message(clinic_id, user, "assistant", reply)
                 return Response(str(resp), mimetype="application/xml")
 
-            # ✅ cancel patient reminder for that appointment
             try:
                 cancel_jobs_for_appointment("patient_reminder", cancelled["id"])
             except Exception as e:
                 print("Cancel reminder jobs failed:", repr(e))
+
+            # ✅ PATCH: update Sheets status by REF (uses cancelled["ref_code"])
+            try:
+                update_sheet_status_by_ref(cancelled.get("ref_code"), "Cancelled", clinic_sheet_id, clinic_sheet_tab)
+            except Exception as e:
+                print("Sheets cancel(latest) update failed:", repr(e))
 
             reply = f"✅ Cancelled your appointment on {cancelled['date']} at {cancelled['time']}. Ref: {cancelled['ref_code']}"
             msg.body(reply)
@@ -422,11 +433,16 @@ def register_routes(app):
             set_state_and_draft(clinic_id, user, "collect_name", {})
 
             if cancelled:
-                # ✅ cancel patient reminder for the cancelled appointment
                 try:
                     cancel_jobs_for_appointment("patient_reminder", cancelled["id"])
                 except Exception as e:
                     print("Cancel reminder jobs failed:", repr(e))
+
+                # ✅ PATCH: mark old appointment as Rescheduled (by ref)
+                try:
+                    update_sheet_status_by_ref(cancelled.get("ref_code"), "Rescheduled", clinic_sheet_id, clinic_sheet_tab)
+                except Exception as e:
+                    print("Sheets reschedule update failed:", repr(e))
 
                 reply = f"✅ Cancelled {cancelled['date']} {cancelled['time']} (Ref: {cancelled['ref_code']}).\nLet’s reschedule. What’s your full name?"
 
@@ -461,6 +477,80 @@ def register_routes(app):
         # Booking state machine
         # -------------------------
         state, draft = get_state_and_draft(clinic_id, user)
+
+        # ✅ NEW: Natural-language cancel/reschedule BEFORE booking intent
+        # This prevents the bot from asking for name/date/time when user is cancelling.
+        if state in [None, "", "idle"] and (is_cancel_intent(incoming) or is_reschedule_intent(incoming)):
+            if is_reschedule_intent(incoming):
+                # Reuse existing reschedule command behavior
+                clear_state_machine(clinic_id, user)
+                cancelled = cancel_latest_appointment(clinic_id, user)
+                set_state_and_draft(clinic_id, user, "collect_name", {})
+
+                if cancelled:
+                    try:
+                        cancel_jobs_for_appointment("patient_reminder", cancelled["id"])
+                    except Exception as e:
+                        print("Cancel reminder jobs failed:", repr(e))
+
+                    # ✅ PATCH: mark old appointment as Rescheduled (by ref)
+                    try:
+                        update_sheet_status_by_ref(cancelled.get("ref_code"), "Rescheduled", clinic_sheet_id, clinic_sheet_tab)
+                    except Exception as e:
+                        print("Sheets reschedule update failed:", repr(e))
+
+                    reply = f"✅ Cancelled {cancelled['date']} {cancelled['time']} (Ref: {cancelled['ref_code']}).\nLet’s reschedule. What’s your full name?"
+                else:
+                    reply = "No active appointment found, but I can help you book a new one. What’s your full name?"
+
+                msg.body(reply)
+                save_message(clinic_id, user, "assistant", reply)
+                return Response(str(resp), mimetype="application/xml")
+
+            # cancel intent
+            set_state_and_draft(clinic_id, user, "await_cancel_ref", {})
+            reply = (
+                "Sure — I can cancel it.\n"
+                "If you have your reference code, reply like: cancel AP-XXXXXX\n"
+                "If you don’t have it, reply: cancel"
+            )
+            msg.body(reply)
+            save_message(clinic_id, user, "assistant", reply)
+            return Response(str(resp), mimetype="application/xml")
+
+        # ✅ NEW: handle awaiting cancel reference
+        if state == "await_cancel_ref":
+            # If they pasted ref code, the existing regex handler above already caught it.
+            # If they typed "cancel", use cancel latest.
+            if incoming.strip().lower() == "cancel":
+                clear_state_machine(clinic_id, user)
+                cancelled = cancel_latest_appointment(clinic_id, user)
+                if not cancelled:
+                    reply = "I couldn’t find an active booked appointment to cancel."
+                    msg.body(reply)
+                    save_message(clinic_id, user, "assistant", reply)
+                    return Response(str(resp), mimetype="application/xml")
+
+                try:
+                    cancel_jobs_for_appointment("patient_reminder", cancelled["id"])
+                except Exception as e:
+                    print("Cancel reminder jobs failed:", repr(e))
+
+                # ✅ PATCH: update Sheets status by REF
+                try:
+                    update_sheet_status_by_ref(cancelled.get("ref_code"), "Cancelled", clinic_sheet_id, clinic_sheet_tab)
+                except Exception as e:
+                    print("Sheets cancel(await_cancel_ref) update failed:", repr(e))
+
+                reply = f"✅ Cancelled your appointment on {cancelled['date']} at {cancelled['time']}. Ref: {cancelled['ref_code']}"
+                msg.body(reply)
+                save_message(clinic_id, user, "assistant", reply)
+                return Response(str(resp), mimetype="application/xml")
+
+            reply = "Please reply with your reference like: cancel AP-XXXXXX — or reply: cancel (to cancel your latest appointment)."
+            msg.body(reply)
+            save_message(clinic_id, user, "assistant", reply)
+            return Response(str(resp), mimetype="application/xml")
 
         if state in [None, "", "idle"] and _is_greeting(incoming):
             clinic_name = clinic_settings.get("name", "PrimeCare Dental Clinic")
@@ -570,6 +660,14 @@ def register_routes(app):
                 appt_id, ref_code = save_appointment_local(clinic_id, user, name, date, time_24)
 
                 ok = append_to_sheet(date, time_24, name, user, clinic_sheet_id, clinic_sheet_tab)
+
+                # ✅ PATCH: write REF into Sheets immediately after append succeeds
+                if ok:
+                    try:
+                        append_ref_to_latest_row(ref_code, clinic_sheet_id, clinic_sheet_tab)
+                    except Exception as e:
+                        print("Sheets REF write failed:", repr(e))
+
                 if ok:
                     update_sheet_sync_status(appt_id, "synced")
                 else:
@@ -581,7 +679,6 @@ def register_routes(app):
                 msg.body(reply)
                 save_message(clinic_id, user, "assistant", reply)
 
-                # ✅ NEW: notify admins
                 _enqueue_admin_notify(
                     clinic_id,
                     clinic_settings,
@@ -589,7 +686,6 @@ def register_routes(app):
                     appointment_id=appt_id
                 )
 
-                # ✅ NEW: schedule patient reminder (2 hours before)
                 _schedule_patient_reminder(
                     clinic_id=clinic_id,
                     user_number=user,
@@ -615,10 +711,6 @@ def register_routes(app):
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
-        # ✅ CHANGE 1: remove forced booking prompt for dental keywords
-        # (deleted block that was here)
-
-        # ✅ CHANGE 2: ai.py updated expects a clinic dict
         clinic = {
             "id": clinic_id,
             "name": clinic_settings.get("name", "PrimeCare Dental Clinic"),
@@ -627,13 +719,9 @@ def register_routes(app):
 
         reply = ai_reply(clinic, user, incoming)
 
-        # ✅ MARKER CHANGE (ONLY CHANGE):
-        # If AI suggests booking, set a short-lived state to interpret next reply naturally.
-        # Also ensure marker never reaches the patient.
-        if OFFER_BOOKING_MARKER in reply:
-            reply = reply.replace(OFFER_BOOKING_MARKER, "").strip()
-            if state in ["idle", None, ""]:
-                set_state_and_draft(clinic_id, user, "offer_booking", {})
+        # If AI suggests booking, set a short-lived state to interpret next reply naturally
+        if state in ["idle", None, ""] and ("book" in reply.lower() or "appointment" in reply.lower()):
+            set_state_and_draft(clinic_id, user, "offer_booking", {})
 
         msg.body(reply)
         save_message(clinic_id, user, "assistant", reply)

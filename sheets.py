@@ -76,6 +76,8 @@ def get_sheet_header_map(spreadsheet_id=None, sheet_tab=None):
             "phone": ["phone", "phone number", "mobile", "number"],
             "status": ["status"],
             "source": ["source"],
+            # ✅ PATCH: support REF column for cancel/reschedule syncing
+            "ref": ["ref", "reference", "reference code", "ref code"],
         }
 
         out = {}
@@ -174,3 +176,131 @@ def append_to_sheet(date, time, name, phone, sheet_id=None, sheet_tab=None):
     except Exception as e:
         print("Sheets append FAILED:", repr(e))
         return False
+
+
+# =========================================================
+# ✅ PATCH HELPERS (added only — does not change existing logic)
+# =========================================================
+
+def append_ref_to_latest_row(ref_code: str, sheet_id=None, sheet_tab=None) -> bool:
+    """
+    After append_to_sheet() succeeds, call this to store REF on the latest row.
+    Safe approach: finds the last non-empty DATE row and writes REF there.
+    Returns True if written.
+    """
+    global sheets_api
+    if not sheets_api:
+        return False
+
+    ref_code = (ref_code or "").strip()
+    if not ref_code:
+        return False
+
+    sid = (sheet_id or GOOGLE_SHEETS_ID or DEFAULT_SHEET_ID or "").strip()
+    tab = (sheet_tab or SHEET_TAB or DEFAULT_SHEET_TAB or "Sheet1").strip()
+    if not sid:
+        return False
+
+    try:
+        header_map = get_sheet_header_map(sid, tab) or {}
+        if "ref" not in header_map:
+            print("Sheets REF write skipped: no REF column detected in header.")
+            return False
+
+        ref_col_letter = header_map["ref"]
+        ref_i = _col_to_idx(ref_col_letter)
+
+        # We locate "latest row" by scanning DATE column (or column A) from A2:Z
+        res = sheets_api.values().get(
+            spreadsheetId=sid,
+            range=a1(tab, "A2:Z")
+        ).execute()
+
+        rows = res.get("values", [])
+        if not rows:
+            return False
+
+        # last row with any content in first 1-3 columns (common safe heuristic)
+        last_idx = None
+        for i in range(len(rows) - 1, -1, -1):
+            r = rows[i]
+            # consider row "real" if it has a date/time/name/phone in first few cols
+            head = " ".join([str(x).strip() for x in r[:4] if str(x).strip()])
+            if head:
+                last_idx = i
+                break
+
+        if last_idx is None:
+            return False
+
+        row_num = last_idx + 2  # because A2 starts row 2
+        target_range = f"{tab}!{ref_col_letter}{row_num}"
+
+        sheets_api.values().update(
+            spreadsheetId=sid,
+            range=target_range,
+            valueInputOption="RAW",
+            body={"values": [[ref_code]]}
+        ).execute()
+
+        return True
+
+    except Exception as e:
+        print("Sheets REF write error:", repr(e))
+        return False
+
+
+def update_sheet_status_by_ref(ref_code: str, new_status: str, sheet_id=None, sheet_tab=None) -> bool:
+    """
+    Finds a row by REF and updates STATUS column.
+    Returns True if updated, False if not found or error.
+    """
+    global sheets_api
+    if not sheets_api:
+        return False
+
+    ref_code = (ref_code or "").strip()
+    if not ref_code:
+        return False
+
+    sid = (sheet_id or GOOGLE_SHEETS_ID or DEFAULT_SHEET_ID or "").strip()
+    tab = (sheet_tab or SHEET_TAB or DEFAULT_SHEET_TAB or "Sheet1").strip()
+    if not sid:
+        return False
+
+    try:
+        header_map = get_sheet_header_map(sid, tab) or {}
+        if "ref" not in header_map or "status" not in header_map:
+            print("Sheets status update skipped: missing REF/STATUS columns.")
+            return False
+
+        ref_i = _col_to_idx(header_map["ref"])
+        status_col_letter = header_map["status"]
+
+        res = sheets_api.values().get(
+            spreadsheetId=sid,
+            range=a1(tab, "A2:Z")
+        ).execute()
+
+        rows = res.get("values", [])
+        for idx, row in enumerate(rows):
+            sheet_ref = row[ref_i] if len(row) > ref_i else ""
+            if str(sheet_ref).strip().upper() == ref_code.upper():
+                row_num = idx + 2
+                target_range = f"{tab}!{status_col_letter}{row_num}"
+
+                sheets_api.values().update(
+                    spreadsheetId=sid,
+                    range=target_range,
+                    valueInputOption="RAW",
+                    body={"values": [[new_status]]}
+                ).execute()
+
+                return True
+
+        return False
+
+    except Exception as e:
+        print("Sheets status update error:", repr(e))
+        return False
+

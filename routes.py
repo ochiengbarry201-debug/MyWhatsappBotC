@@ -6,7 +6,7 @@ from flask import request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 
 from admin import is_admin
-from ai import ai_reply
+from ai import ai_reply, ai_extract_booking_signal
 from booking import check_double_booking, save_appointment_local
 from clinic import resolve_clinic_id, get_clinic_sheet_config
 from db import (
@@ -28,56 +28,38 @@ from hours import (
 )
 from intents import is_booking_intent, looks_like_date, is_cancel_intent, is_reschedule_intent
 
-# ✅ PATCH: import REF + status update helpers (leaves existing append_to_sheet intact)
 from sheets import append_to_sheet, append_ref_to_latest_row, update_sheet_status_by_ref
 
-# ✅ job status helpers
 from jobs import get_job_counts, count_stale_running_jobs, list_failed_jobs
-
-# ✅ NEW: enqueue jobs + cancel reminder jobs
 from jobs import enqueue_job, cancel_jobs_for_appointment
 
 
-# -------------------------
-# Notifications + reminders config
-# -------------------------
 REMINDER_MINUTES_BEFORE = 120  # 2 hours before appointment
 
 
 def _is_greeting(text: str) -> bool:
-    """
-    Broad greeting detector for first-contact welcome.
-    IMPORTANT: Avoid substring matches like 'hi' inside 'this'.
-    Keeps logic simple & scale-friendly.
-    """
     if not text:
         return False
 
     t = text.lower().strip()
-
-    # Normalize punctuation to spaces so word/phrase checks behave well
     t_norm = re.sub(r"[^a-z0-9\s]", " ", t)
     t_norm = re.sub(r"\s+", " ", t_norm).strip()
 
-    # Greetings are usually short; prevents weird mid-convo triggers
     if len(t_norm) > 30:
         return False
 
-    # Phrase greetings (match full message)
     phrases = {
         "good morning", "good afternoon", "good evening", "good day",
         "morning", "afternoon", "evening",
         "habari", "niaje", "sasa", "mambo",
-        "goodmorning", "goodafternoon", "goodevening"  # no-space variants
+        "goodmorning", "goodafternoon", "goodevening"
     }
     if t_norm in phrases:
         return True
 
-    # Single-word greetings (match whole words only)
     words = set(t_norm.split())
     single_words = {"hi", "hello", "hey", "yo"}
 
-    # Keep it tight: only trigger on short, greeting-like messages
     if len(words) <= 3 and not any(ch.isdigit() for ch in t_norm) and (words & single_words):
         return True
 
@@ -85,10 +67,6 @@ def _is_greeting(text: str) -> bool:
 
 
 def _looks_like_booking_agree(text: str) -> bool:
-    """
-    Broad 'yes / proceed / help me book' detector.
-    Not locked to exact words; uses intent-ish signals.
-    """
     if not text:
         return False
 
@@ -96,14 +74,12 @@ def _looks_like_booking_agree(text: str) -> bool:
     t_norm = re.sub(r"[^a-z0-9\s]", " ", t)
     t_norm = re.sub(r"\s+", " ", t_norm).strip()
 
-    # Positive/proceed signals (broad)
     positive = [
         "yes", "yeah", "yep", "sure", "okay", "ok", "alright", "proceed", "go ahead",
         "please", "kindly", "sounds good", "that works", "i would", "i want", "i need",
         "help me", "can you", "could you"
     ]
 
-    # Booking-ish signals
     bookingish = [
         "book", "booking", "appointment", "schedule", "reschedule", "visit", "come in",
         "see dentist", "see the dentist", "consultation", "checkup", "check-up"
@@ -128,17 +104,12 @@ def _looks_like_booking_decline(text: str) -> bool:
 
 
 def _safe_admin_numbers(clinic_settings: dict):
-    """
-    Reads admin numbers from clinic settings:
-    clinic_settings = {"admins": ["+2547...", "+2547..."], ...}
-    Returns list of strings.
-    """
     admins = []
     if isinstance(clinic_settings, dict):
         raw = clinic_settings.get("admins", [])
         if isinstance(raw, list):
             admins = [str(x).strip() for x in raw if str(x).strip()]
-    # Deduplicate preserving order
+
     seen = set()
     out = []
     for a in admins:
@@ -149,12 +120,8 @@ def _safe_admin_numbers(clinic_settings: dict):
 
 
 def _enqueue_admin_notify(clinic_id, clinic_settings: dict, body: str, appointment_id=None):
-    """
-    Enqueues a notify_admin job to each configured admin.
-    """
     admins = _safe_admin_numbers(clinic_settings)
     if not admins:
-        # No admins configured; nothing to notify (silent by design)
         return
 
     for a in admins:
@@ -170,24 +137,17 @@ def _enqueue_admin_notify(clinic_id, clinic_settings: dict, body: str, appointme
 
 
 def _schedule_patient_reminder(clinic_id, user_number: str, clinic_settings: dict, appointment_id: int, date: str, time_24h: str, ref_code: str = None, tz_name: str = "Africa/Nairobi"):
-    """
-    Schedules a patient reminder job REMINDER_MINUTES_BEFORE minutes before appointment.
-    If appointment time is too soon or in the past, it skips scheduling.
-    """
     try:
         tz = ZoneInfo(tz_name or "Africa/Nairobi")
         dt = datetime.datetime.strptime(f"{date} {time_24h}", "%Y-%m-%d %H:%M")
         appt_local = dt.replace(tzinfo=tz)
         run_at_local = appt_local - datetime.timedelta(minutes=REMINDER_MINUTES_BEFORE)
 
-        # convert to UTC naive (matches jobs.py utc now style)
         run_at_utc = run_at_local.astimezone(datetime.timezone.utc).replace(tzinfo=None)
 
-        # If reminder time already passed, skip
         if run_at_utc <= datetime.datetime.utcnow():
             return
 
-        # Message
         ref_part = f" Ref: {ref_code}" if ref_code else ""
         body = f"Reminder: you have an appointment on {date} at {time_24h}.{ref_part}"
 
@@ -232,7 +192,12 @@ def register_routes(app):
         clinic_sheet_id, clinic_sheet_tab = get_clinic_sheet_config(clinic_settings)
         tz_name, slot_minutes, weekly = get_hours_settings(clinic_settings)
 
-        # Idempotency
+        clinic = {
+            "id": clinic_id,
+            "name": clinic_settings.get("name", "PrimeCare Dental Clinic"),
+            "timezone": tz_name
+        }
+
         twilio_sid = (request.values.get("MessageSid") or "").strip()
         if twilio_sid and already_processed_twilio_sid(twilio_sid):
             msg.body("✅ Received.")
@@ -240,9 +205,6 @@ def register_routes(app):
 
         save_message(clinic_id, user, "user", incoming, twilio_sid=twilio_sid)
 
-        # -------------------------
-        # Commands
-        # -------------------------
         if incoming.strip().lower() == "today":
             if not is_admin(user, clinic_settings):
                 reply = "Not authorized."
@@ -293,7 +255,6 @@ def register_routes(app):
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
-        # ✅ ADMIN COMMAND: "jobs"
         if incoming.strip().lower() == "jobs":
             if not is_admin(user, clinic_settings):
                 reply = "Not authorized."
@@ -319,7 +280,6 @@ def register_routes(app):
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
-        # ✅ ADMIN COMMAND: "failed jobs"
         if incoming.strip().lower() in ["failed jobs", "jobs failed"]:
             if not is_admin(user, clinic_settings):
                 reply = "Not authorized."
@@ -356,7 +316,6 @@ def register_routes(app):
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
-        # cancel by reference: "cancel AP-XXXXXX"
         m = re.match(r"^cancel\s+(AP-[A-Z0-9]{6})$", incoming.strip().upper())
         if m:
             ref_code = m.group(1)
@@ -374,7 +333,6 @@ def register_routes(app):
                 save_message(clinic_id, user, "assistant", reply)
                 return Response(str(resp), mimetype="application/xml")
 
-            # ✅ PATCH: update Sheets status by REF
             try:
                 update_sheet_status_by_ref(ref_code, "Cancelled", clinic_sheet_id, clinic_sheet_tab)
             except Exception as e:
@@ -393,7 +351,6 @@ def register_routes(app):
 
             return Response(str(resp), mimetype="application/xml")
 
-        # cancel latest
         if incoming.strip().lower() == "cancel":
             clear_state_machine(clinic_id, user)
             cancelled = cancel_latest_appointment(clinic_id, user)
@@ -408,7 +365,6 @@ def register_routes(app):
             except Exception as e:
                 print("Cancel reminder jobs failed:", repr(e))
 
-            # ✅ PATCH: update Sheets status by REF (uses cancelled["ref_code"])
             try:
                 update_sheet_status_by_ref(cancelled.get("ref_code"), "Cancelled", clinic_sheet_id, clinic_sheet_tab)
             except Exception as e:
@@ -438,7 +394,6 @@ def register_routes(app):
                 except Exception as e:
                     print("Cancel reminder jobs failed:", repr(e))
 
-                # ✅ PATCH: mark old appointment as Rescheduled (by ref)
                 try:
                     update_sheet_status_by_ref(cancelled.get("ref_code"), "Rescheduled", clinic_sheet_id, clinic_sheet_tab)
                 except Exception as e:
@@ -473,16 +428,12 @@ def register_routes(app):
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
-        # -------------------------
-        # Booking state machine
-        # -------------------------
         state, draft = get_state_and_draft(clinic_id, user)
+        extracted = ai_extract_booking_signal(clinic, incoming)
+        extracted_intent = extracted.get("intent", "general")
 
-        # ✅ NEW: Natural-language cancel/reschedule BEFORE booking intent
-        # This prevents the bot from asking for name/date/time when user is cancelling.
-        if state in [None, "", "idle"] and (is_cancel_intent(incoming) or is_reschedule_intent(incoming)):
-            if is_reschedule_intent(incoming):
-                # Reuse existing reschedule command behavior
+        if state in [None, "", "idle"] and (extracted_intent in ["cancel", "reschedule"] or is_cancel_intent(incoming) or is_reschedule_intent(incoming)):
+            if extracted_intent == "reschedule" or is_reschedule_intent(incoming):
                 clear_state_machine(clinic_id, user)
                 cancelled = cancel_latest_appointment(clinic_id, user)
                 set_state_and_draft(clinic_id, user, "collect_name", {})
@@ -493,7 +444,6 @@ def register_routes(app):
                     except Exception as e:
                         print("Cancel reminder jobs failed:", repr(e))
 
-                    # ✅ PATCH: mark old appointment as Rescheduled (by ref)
                     try:
                         update_sheet_status_by_ref(cancelled.get("ref_code"), "Rescheduled", clinic_sheet_id, clinic_sheet_tab)
                     except Exception as e:
@@ -507,7 +457,6 @@ def register_routes(app):
                 save_message(clinic_id, user, "assistant", reply)
                 return Response(str(resp), mimetype="application/xml")
 
-            # cancel intent
             set_state_and_draft(clinic_id, user, "await_cancel_ref", {})
             reply = (
                 "Sure — I can cancel it.\n"
@@ -518,10 +467,7 @@ def register_routes(app):
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
-        # ✅ NEW: handle awaiting cancel reference
         if state == "await_cancel_ref":
-            # If they pasted ref code, the existing regex handler above already caught it.
-            # If they typed "cancel", use cancel latest.
             if incoming.strip().lower() == "cancel":
                 clear_state_machine(clinic_id, user)
                 cancelled = cancel_latest_appointment(clinic_id, user)
@@ -536,7 +482,6 @@ def register_routes(app):
                 except Exception as e:
                     print("Cancel reminder jobs failed:", repr(e))
 
-                # ✅ PATCH: update Sheets status by REF
                 try:
                     update_sheet_status_by_ref(cancelled.get("ref_code"), "Cancelled", clinic_sheet_id, clinic_sheet_tab)
                 except Exception as e:
@@ -552,14 +497,13 @@ def register_routes(app):
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
-        if state in [None, "", "idle"] and _is_greeting(incoming):
+        if state in [None, "", "idle"] and (extracted_intent == "greeting" or _is_greeting(incoming)):
             clinic_name = clinic_settings.get("name", "PrimeCare Dental Clinic")
             reply = f"Hello 👋 Welcome to {clinic_name}. How may we help you today?"
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
-        # ✅ NEW: If AI suggested booking, we catch the next reply here (broadly)
         if state == "offer_booking":
             if _looks_like_booking_agree(incoming):
                 set_state_and_draft(clinic_id, user, "collect_name", {})
@@ -570,17 +514,45 @@ def register_routes(app):
 
             if _looks_like_booking_decline(incoming):
                 clear_state_machine(clinic_id, user)
-                # fall through to AI below
-
             else:
                 reply = "No problem. Would you like me to help you book an appointment? (yes/no)"
                 msg.body(reply)
                 save_message(clinic_id, user, "assistant", reply)
                 return Response(str(resp), mimetype="application/xml")
 
-        if state in ["idle", None, ""] and is_booking_intent(incoming):
-            set_state_and_draft(clinic_id, user, "collect_name", {})
-            reply = "Sure. What's your full name?"
+        if state in ["idle", None, ""] and (extracted_intent == "book" or is_booking_intent(incoming)):
+            draft = draft or {}
+
+            if extracted.get("name"):
+                draft["name"] = extracted["name"]
+            if extracted.get("date"):
+                draft["date"] = extracted["date"]
+            if extracted.get("time"):
+                draft["time"] = extracted["time"]
+
+            if not draft.get("name"):
+                set_state_and_draft(clinic_id, user, "collect_name", draft)
+                reply = "Sure. What's your full name?"
+                msg.body(reply)
+                save_message(clinic_id, user, "assistant", reply)
+                return Response(str(resp), mimetype="application/xml")
+
+            if not draft.get("date"):
+                set_state_and_draft(clinic_id, user, "collect_date", draft)
+                reply = "What date would you like? (YYYY-MM-DD)"
+                msg.body(reply)
+                save_message(clinic_id, user, "assistant", reply)
+                return Response(str(resp), mimetype="application/xml")
+
+            if not draft.get("time"):
+                set_state_and_draft(clinic_id, user, "collect_time", draft)
+                reply = f"What time would you prefer? (HH:MM) e.g. 14:00. Slots are {slot_minutes} minutes."
+                msg.body(reply)
+                save_message(clinic_id, user, "assistant", reply)
+                return Response(str(resp), mimetype="application/xml")
+
+            set_state_and_draft(clinic_id, user, "confirm", draft)
+            reply = f"Confirm appointment on {draft['date']} at {draft['time']}? (yes/no)"
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
@@ -661,7 +633,6 @@ def register_routes(app):
 
                 ok = append_to_sheet(date, time_24, name, user, clinic_sheet_id, clinic_sheet_tab)
 
-                # ✅ PATCH: write REF into Sheets immediately after append succeeds
                 if ok:
                     try:
                         append_ref_to_latest_row(ref_code, clinic_sheet_id, clinic_sheet_tab)
@@ -711,15 +682,8 @@ def register_routes(app):
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
 
-        clinic = {
-            "id": clinic_id,
-            "name": clinic_settings.get("name", "PrimeCare Dental Clinic"),
-            "timezone": tz_name
-        }
-
         reply = ai_reply(clinic, user, incoming)
 
-        # If AI suggests booking, set a short-lived state to interpret next reply naturally
         if state in ["idle", None, ""] and ("book" in reply.lower() or "appointment" in reply.lower()):
             set_state_and_draft(clinic_id, user, "offer_booking", {})
 

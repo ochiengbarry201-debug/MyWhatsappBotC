@@ -1,8 +1,9 @@
 from openai import OpenAI
 from config import OPENAI_API_KEY, CLINIC_NAME
 from db import load_recent_messages
+import json
 
-# ✅ Marker that routes.py will detect and remove before sending to the user
+# ✅ Marker that routes.py can use if AI explicitly offers booking in normal chat replies
 OFFER_BOOKING_MARKER = "<<OFFER_BOOKING>>"
 
 openai_client = None
@@ -76,3 +77,87 @@ def ai_reply(clinic: dict, user: str, msg: str):
         return "Sorry, something went wrong. Please try again."
 
 
+def ai_extract_booking_signal(clinic: dict, user_text: str):
+    """
+    Extract structured intent + booking info from a free-form user message.
+
+    Returns:
+    {
+      "intent": "greeting|general|book|cancel|reschedule",
+      "name": None | str,
+      "date": None | str,
+      "time": None | str
+    }
+    """
+    clinic_name = clinic.get("name") or CLINIC_NAME
+
+    if not openai_client:
+        return {
+            "intent": "general",
+            "name": None,
+            "date": None,
+            "time": None,
+        }
+
+    system = f"""
+You extract structured appointment information for {clinic_name}.
+
+Return ONLY valid JSON with exactly these keys:
+- intent
+- name
+- date
+- time
+
+Rules:
+- intent must be one of: greeting, general, book, cancel, reschedule
+- Use intent="greeting" only for simple greetings like hi, hello, morning, good afternoon
+- Use intent="general" for dental questions, normal chat, or anything that is not clearly booking/cancel/reschedule
+- Use intent="book" when the user wants a new appointment / visit / consultation
+- Use intent="cancel" when the user wants to cancel an appointment
+- Use intent="reschedule" when the user wants to move/change an existing appointment
+- name should be null if not clearly provided
+- date should be null unless the user clearly provided a date
+- time should be null unless the user clearly provided a time
+- If the user says something vague like "morning", "afternoon", "evening", do not invent an exact clock time
+- Do not add any extra keys
+- Do not explain anything
+""".strip()
+
+    try:
+        res = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_text},
+            ],
+            temperature=0,
+            max_tokens=120,
+            response_format={"type": "json_object"},
+        )
+
+        raw = res.choices[0].message.content.strip()
+        data = json.loads(raw)
+
+        intent = str(data.get("intent") or "general").strip().lower()
+        if intent not in {"greeting", "general", "book", "cancel", "reschedule"}:
+            intent = "general"
+
+        name = data.get("name")
+        date = data.get("date")
+        time = data.get("time")
+
+        return {
+            "intent": intent,
+            "name": name if name else None,
+            "date": date if date else None,
+            "time": time if time else None,
+        }
+
+    except Exception as e:
+        print("AI extract error:", repr(e))
+        return {
+            "intent": "general",
+            "name": None,
+            "date": None,
+            "time": None,
+        }

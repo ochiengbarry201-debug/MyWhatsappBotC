@@ -6,8 +6,12 @@ from sheets import append_to_sheet
 from db import db_conn, update_sheet_sync_status, load_clinic_settings
 from clinic import get_clinic_sheet_config
 
-# ✅ NEW: Twilio sender (for notify_admin + patient_reminder jobs)
+# ✅ Keep for notify_admin jobs
 from notifier import send_whatsapp
+
+# ✅ NEW: clinic-based template reminder sender
+from send_clinic_reminder import send_appointment_reminder
+from clinic_readiness import clinic_can_send_reminders
 
 SWEEP_EVERY_SECONDS = 120
 SWEEP_LIMIT = 50
@@ -41,18 +45,60 @@ def handle_job(job):
             update_sheet_sync_status(appointment_id, "failed", "Sheets append returned False (check worker logs)")
             raise RuntimeError("Sheets append returned False")
 
-    # ✅ NEW: notify admins when booked/cancelled/rescheduled
+    # ✅ Keep admin notifications on normal WhatsApp send
     if job_type == "notify_admin":
         to_number = payload.get("to")
         body = payload.get("body", "")
+        print(f"[ADMIN_NOTIFY] Sending admin notification to={to_number}")
         send_whatsapp(to_number, body)
+        print(f"[ADMIN_NOTIFY] Sent admin notification to={to_number}")
         return True
 
-    # ✅ NEW: patient reminder job (scheduled run_at in jobs table)
+    # ✅ NEW: patient reminder job now uses clinic-specific template send
     if job_type == "patient_reminder":
+        clinic_id = payload.get("clinic_id")
         to_number = payload.get("to")
-        body = payload.get("body", "")
-        send_whatsapp(to_number, body)
+        patient_name = payload.get("patient_name") or payload.get("name") or "Patient"
+        clinic_name = payload.get("clinic_name") or "Our Clinic"
+        appt_date = payload.get("date")
+        appt_time = payload.get("time")
+
+        print(
+            f"[REMINDER] Preparing clinic reminder "
+            f"clinic_id={clinic_id} to={to_number} patient_name={patient_name} "
+            f"date={appt_date} time={appt_time}"
+        )
+
+        if not clinic_id:
+            raise RuntimeError("patient_reminder missing clinic_id")
+
+        if not to_number:
+            raise RuntimeError("patient_reminder missing to number")
+
+        if not appt_date:
+            raise RuntimeError("patient_reminder missing date")
+
+        if not appt_time:
+            raise RuntimeError("patient_reminder missing time")
+
+        ok, reason = clinic_can_send_reminders(clinic_id)
+        if not ok:
+            raise RuntimeError(f"Reminder blocked: {reason}")
+
+        result = send_appointment_reminder(
+            clinic_id=clinic_id,
+            to_number=to_number,
+            patient_name=patient_name,
+            clinic_name=clinic_name,
+            appt_date=appt_date,
+            appt_time=appt_time
+        )
+
+        print(
+            f"[REMINDER] Sent successfully "
+            f"clinic_id={clinic_id} to={to_number} "
+            f"sid={result.get('sid')} status={result.get('status')}"
+        )
         return True
 
     print("Unknown job_type:", job_type, "job_id:", job["id"])

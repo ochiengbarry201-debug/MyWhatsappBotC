@@ -136,7 +136,17 @@ def _enqueue_admin_notify(clinic_id, clinic_settings: dict, body: str, appointme
         )
 
 
-def _schedule_patient_reminder(clinic_id, user_number: str, clinic_settings: dict, appointment_id: int, date: str, time_24h: str, ref_code: str = None, tz_name: str = "Africa/Nairobi"):
+def _schedule_patient_reminder(
+    clinic_id,
+    user_number: str,
+    clinic_settings: dict,
+    appointment_id: int,
+    patient_name: str,
+    date: str,
+    time_24h: str,
+    ref_code: str = None,
+    tz_name: str = "Africa/Nairobi"
+):
     try:
         tz = ZoneInfo(tz_name or "Africa/Nairobi")
         dt = datetime.datetime.strptime(f"{date} {time_24h}", "%Y-%m-%d %H:%M")
@@ -146,21 +156,37 @@ def _schedule_patient_reminder(clinic_id, user_number: str, clinic_settings: dic
         run_at_utc = run_at_local.astimezone(datetime.timezone.utc).replace(tzinfo=None)
 
         if run_at_utc <= datetime.datetime.utcnow():
+            print(
+                f"[REMINDER] Skipped scheduling because reminder time already passed "
+                f"clinic_id={clinic_id} appointment_id={appointment_id} date={date} time={time_24h}"
+            )
             return
 
-        ref_part = f" Ref: {ref_code}" if ref_code else ""
-        body = f"Reminder: you have an appointment on {date} at {time_24h}.{ref_part}"
+        clinic_name = "Our Clinic"
+        if isinstance(clinic_settings, dict):
+            clinic_name = clinic_settings.get("name", "Our Clinic")
 
         enqueue_job(
             "patient_reminder",
             {
-                "to": user_number,
-                "body": body,
                 "clinic_id": str(clinic_id),
-                "appointment_id": str(appointment_id)
+                "appointment_id": str(appointment_id),
+                "to": user_number,
+                "patient_name": patient_name or "Patient",
+                "clinic_name": clinic_name,
+                "date": date,
+                "time": time_24h,
+                "ref_code": ref_code or ""
             },
             run_at=run_at_utc
         )
+
+        print(
+            f"[REMINDER] Scheduled reminder "
+            f"clinic_id={clinic_id} appointment_id={appointment_id} to={user_number} "
+            f"run_at_utc={run_at_utc} date={date} time={time_24h}"
+        )
+
     except Exception as e:
         print("Failed to schedule reminder:", repr(e))
 
@@ -662,6 +688,7 @@ def register_routes(app):
                     user_number=user,
                     clinic_settings=clinic_settings,
                     appointment_id=appt_id,
+                    patient_name=name,
                     date=date,
                     time_24h=time_24,
                     ref_code=ref_code,

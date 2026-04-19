@@ -110,9 +110,9 @@ Return ONLY valid JSON with exactly these keys:
 
 Rules:
 - intent must be one of: greeting, general, book, cancel, reschedule
-- Use intent="greeting" only for simple greetings like hi, hello, morning, good afternoon
+- Use intent="greeting" only for simple greetings with no real request
 - Use intent="general" for dental questions, normal chat, or anything that is not clearly booking/cancel/reschedule
-- Use intent="book" when the user wants a new appointment / visit / consultation
+- Use intent="book" when the user wants a new appointment / visit / consultation / checkup / booking / to see the dentist
 - Use intent="cancel" when the user wants to cancel an appointment
 - Use intent="reschedule" when the user wants to move/change an existing appointment
 - name should be null if not clearly provided
@@ -121,6 +121,25 @@ Rules:
 - If the user says something vague like "morning", "afternoon", "evening", do not invent an exact clock time
 - Do not add any extra keys
 - Do not explain anything
+
+Important booking detection:
+- Detect booking intent even if mixed with a greeting
+- Detect booking intent even in casual wording
+- Detect booking intent in both English and common Swahili phrasing
+
+Examples of booking intent:
+- I want an appointment
+- Can I book for tomorrow?
+- I need to see the dentist
+- I want to come on Tuesday
+- Book me for Friday
+- nataka appointment
+- nataka booking
+- nataka kuona dentist
+- naweza kuja kesho
+- nipatie appointment
+- I want to visit the clinic
+- can I come tomorrow at 10
 """.strip()
 
     try:
@@ -136,6 +155,8 @@ Rules:
         )
 
         raw = res.choices[0].message.content.strip()
+        print("EXTRACT RAW:", raw)
+
         data = json.loads(raw)
 
         intent = str(data.get("intent") or "general").strip().lower()
@@ -146,12 +167,15 @@ Rules:
         date = data.get("date")
         time = data.get("time")
 
-        return {
+        result = {
             "intent": intent,
-            "name": name if name else None,
-            "date": date if date else None,
-            "time": time if time else None,
+            "name": str(name).strip() if name else None,
+            "date": str(date).strip() if date else None,
+            "time": str(time).strip() if time else None,
         }
+
+        print("EXTRACT PARSED:", result)
+        return result
 
     except Exception as e:
         print("AI extract error:", repr(e))

@@ -6,7 +6,7 @@ from flask import request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 
 from admin import is_admin
-from ai import ai_reply, ai_extract_booking_signal
+from ai import ai_reply, ai_extract_booking_signal, OFFER_BOOKING_MARKER
 from booking import check_double_booking, save_appointment_local
 from clinic import resolve_clinic_id, get_clinic_sheet_config
 from db import (
@@ -550,11 +550,14 @@ def register_routes(app):
             draft = draft or {}
 
             if extracted.get("name"):
-                draft["name"] = extracted["name"]
+                draft["name"] = str(extracted["name"]).strip()
+
             if extracted.get("date"):
-                draft["date"] = extracted["date"]
+                draft["date"] = str(extracted["date"]).strip()
+
             if extracted.get("time"):
-                draft["time"] = extracted["time"]
+                extracted_time = normalize_time_to_24h(str(extracted["time"]).strip())
+                draft["time"] = extracted_time if extracted_time else str(extracted["time"]).strip()
 
             if not draft.get("name"):
                 set_state_and_draft(clinic_id, user, "collect_name", draft)
@@ -570,6 +573,14 @@ def register_routes(app):
                 save_message(clinic_id, user, "assistant", reply)
                 return Response(str(resp), mimetype="application/xml")
 
+            date = draft.get("date", "").strip()
+            if not is_open_on_date(date, tz_name, weekly):
+                set_state_and_draft(clinic_id, user, "collect_date", draft)
+                reply = "Sorry, we’re closed on that day. Please choose another date."
+                msg.body(reply)
+                save_message(clinic_id, user, "assistant", reply)
+                return Response(str(resp), mimetype="application/xml")
+
             if not draft.get("time"):
                 set_state_and_draft(clinic_id, user, "collect_time", draft)
                 reply = f"What time would you prefer? (HH:MM) e.g. 14:00. Slots are {slot_minutes} minutes."
@@ -577,8 +588,40 @@ def register_routes(app):
                 save_message(clinic_id, user, "assistant", reply)
                 return Response(str(resp), mimetype="application/xml")
 
+            time_24 = normalize_time_to_24h(draft.get("time", ""))
+            if not time_24:
+                draft.pop("time", None)
+                set_state_and_draft(clinic_id, user, "collect_time", draft)
+                reply = "Please type the time like 09:30 (HH:MM) or 2:30 PM."
+                msg.body(reply)
+                save_message(clinic_id, user, "assistant", reply)
+                return Response(str(resp), mimetype="application/xml")
+
+            if not is_time_within_hours(date, time_24, tz_name, weekly):
+                set_state_and_draft(clinic_id, user, "collect_time", draft)
+                hours_str = format_opening_hours_for_day(date, tz_name, weekly)
+                reply = f"That time is outside working hours for {date}. Available: {hours_str}."
+                msg.body(reply)
+                save_message(clinic_id, user, "assistant", reply)
+                return Response(str(resp), mimetype="application/xml")
+
+            if not is_slot_aligned(time_24, slot_minutes):
+                set_state_and_draft(clinic_id, user, "collect_time", draft)
+                reply = f"Please choose a time that matches our {slot_minutes}-minute slots (e.g. 09:00, 09:30, 10:00)."
+                msg.body(reply)
+                save_message(clinic_id, user, "assistant", reply)
+                return Response(str(resp), mimetype="application/xml")
+
+            if check_double_booking(clinic_id, date, time_24, clinic_sheet_id, clinic_sheet_tab):
+                set_state_and_draft(clinic_id, user, "collect_time", draft)
+                reply = "That slot is already booked. Choose another time."
+                msg.body(reply)
+                save_message(clinic_id, user, "assistant", reply)
+                return Response(str(resp), mimetype="application/xml")
+
+            draft["time"] = time_24
             set_state_and_draft(clinic_id, user, "confirm", draft)
-            reply = f"Confirm appointment on {draft['date']} at {draft['time']}? (yes/no)"
+            reply = f"Confirm appointment on {date} at {time_24}? (yes/no)"
             msg.body(reply)
             save_message(clinic_id, user, "assistant", reply)
             return Response(str(resp), mimetype="application/xml")
@@ -711,7 +754,13 @@ def register_routes(app):
 
         reply = ai_reply(clinic, user, incoming)
 
-        if state in ["idle", None, ""] and ("book" in reply.lower() or "appointment" in reply.lower()):
+        offered_booking = False
+        if OFFER_BOOKING_MARKER in reply:
+            offered_booking = True
+            reply = reply.replace(OFFER_BOOKING_MARKER, "").strip()
+            reply = re.sub(r"\n{3,}", "\n\n", reply).strip()
+
+        if state in ["idle", None, ""] and offered_booking:
             set_state_and_draft(clinic_id, user, "offer_booking", {})
 
         msg.body(reply)

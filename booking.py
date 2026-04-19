@@ -7,6 +7,29 @@ import psycopg2
 from sheets import sheets_api, a1, get_sheet_header_map, _col_to_idx
 from config import GOOGLE_SHEETS_ID, SHEET_TAB, DEFAULT_SHEET_ID, DEFAULT_SHEET_TAB
 from db import db_conn
+from hours import normalize_time_to_24h
+
+
+def _normalize_sheet_date(value):
+    if value is None:
+        return ""
+    s = str(value).strip()
+
+    try:
+        dt = datetime.datetime.strptime(s, "%Y-%m-%d")
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y", "%Y/%m/%d"):
+        try:
+            dt = datetime.datetime.strptime(s, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    return s
+
 
 # -------------------------------------------------
 # Double booking check (DB + Google Sheets)
@@ -38,6 +61,10 @@ def check_double_booking(clinic_id, date, time, sheet_id=None, sheet_tab=None):
             date_i = _col_to_idx(header_map["date"])
             time_i = _col_to_idx(header_map["time"])
 
+            status_i = None
+            if "status" in header_map:
+                status_i = _col_to_idx(header_map["status"])
+
             res = sheets_api.values().get(
                 spreadsheetId=sid,
                 range=a1(tab, "A2:Z")
@@ -46,18 +73,32 @@ def check_double_booking(clinic_id, date, time, sheet_id=None, sheet_tab=None):
             for row in res.get("values", []):
                 d = row[date_i] if len(row) > date_i else ""
                 t = row[time_i] if len(row) > time_i else ""
-                if d == date and t == time:
+                status = row[status_i] if status_i is not None and len(row) > status_i else ""
+
+                d_norm = _normalize_sheet_date(d)
+                t_norm = normalize_time_to_24h(str(t).strip()) if t else ""
+
+                if status_i is not None and str(status).strip().lower() in {"cancelled", "rescheduled"}:
+                    continue
+
+                if d_norm == date and t_norm == time:
                     return True
 
             return False
 
         res = sheets_api.values().get(
             spreadsheetId=sid,
-            range=a1(tab, "A2:F")
+            range=a1(tab, "A2:Z")
         ).execute()
 
         for row in res.get("values", []):
-            if len(row) >= 2 and row[0] == date and row[1] == time:
+            d = row[0] if len(row) > 0 else ""
+            t = row[1] if len(row) > 1 else ""
+
+            d_norm = _normalize_sheet_date(d)
+            t_norm = normalize_time_to_24h(str(t).strip()) if t else ""
+
+            if d_norm == date and t_norm == time:
                 return True
 
     except Exception as e:
@@ -65,12 +106,14 @@ def check_double_booking(clinic_id, date, time, sheet_id=None, sheet_tab=None):
 
     return False
 
+
 # -------------------------------------------------
 # Appointment reference code
 # -------------------------------------------------
 def generate_ref_code():
     alphabet = string.ascii_uppercase + string.digits
     return "AP-" + "".join(secrets.choice(alphabet) for _ in range(6))
+
 
 def save_appointment_local(clinic_id, user, name, date, time):
     """
@@ -99,7 +142,7 @@ def save_appointment_local(clinic_id, user, name, date, time):
             if getattr(e, "pgcode", None) == "23505":
                 try:
                     conn.close()
-                except:
+                except Exception:
                     pass
                 continue
             raise

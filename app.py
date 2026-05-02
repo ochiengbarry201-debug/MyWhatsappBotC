@@ -6,6 +6,7 @@ from db import init_db
 from sheets import init_sheets
 from ai import init_ai
 from routes import register_routes
+from admin_dashboard import register_admin_dashboard
 
 # -------------------------------------------------
 # Bootstrap (keeps your init behavior)
@@ -18,7 +19,9 @@ init_ai()
 # Flask App
 # -------------------------------------------------
 app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-this-secret-key")
 register_routes(app)
+register_admin_dashboard(app)
 
 # -------------------------------------------------
 # Run

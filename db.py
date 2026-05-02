@@ -3,14 +3,17 @@ import json
 
 import psycopg2
 import psycopg2.extras
+from psycopg2 import IntegrityError
 
 from config import DATABASE_URL
+
 
 def db_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set. This app now requires Postgres.")
     print("DB: USING POSTGRESQL")
     return psycopg2.connect(DATABASE_URL)
+
 
 def init_db():
     conn = db_conn()
@@ -27,6 +30,23 @@ def init_db():
             twilio_sid TEXT
         )
     """)
+
+    try:
+        c.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_twilio_sid
+            ON messages (twilio_sid)
+            WHERE twilio_sid IS NOT NULL
+        """)
+    except Exception as e:
+        print("Index create uq_messages_twilio_sid failed:", repr(e))
+
+    try:
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_clinic_user_created
+            ON messages (clinic_id, user_number, created_at)
+        """)
+    except Exception as e:
+        print("Index create idx_messages_clinic_user_created failed:", repr(e))
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
@@ -107,6 +127,7 @@ def init_db():
     conn.close()
     print("DB tables checked/created successfully")
 
+
 # -------------------------------------------------
 # DB Helpers
 # -------------------------------------------------
@@ -117,12 +138,43 @@ def save_message(clinic_id, user, role, msg, twilio_sid=None):
         """
         INSERT INTO messages (clinic_id, user_number, role, content, created_at, twilio_sid)
         VALUES (%s,%s,%s,%s,%s,%s)
-        ON CONFLICT DO NOTHING
         """,
         (clinic_id, user, role, msg, datetime.datetime.utcnow(), twilio_sid)
     )
     conn.commit()
     conn.close()
+
+
+def save_incoming_message_if_new(clinic_id, user, msg, twilio_sid=None):
+    """
+    Atomic idempotency gate for inbound Twilio webhooks.
+
+    Returns:
+        True  -> inbound message was inserted now, safe to continue processing
+        False -> duplicate Twilio SID already exists, stop processing immediately
+    """
+    conn = db_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO messages (clinic_id, user_number, role, content, created_at, twilio_sid)
+            VALUES (%s,%s,'user',%s,%s,%s)
+            """,
+            (clinic_id, user, msg, datetime.datetime.utcnow(), twilio_sid)
+        )
+        conn.commit()
+        return True
+    except IntegrityError as e:
+        conn.rollback()
+        # Duplicate inbound Twilio webhook
+        if twilio_sid:
+            print(f"Duplicate inbound Twilio SID ignored: {twilio_sid} | error={repr(e)}")
+            return False
+        raise
+    finally:
+        conn.close()
+
 
 def already_processed_twilio_sid(twilio_sid: str) -> bool:
     if not twilio_sid:
@@ -133,6 +185,7 @@ def already_processed_twilio_sid(twilio_sid: str) -> bool:
     exists = c.fetchone() is not None
     conn.close()
     return exists
+
 
 def load_recent_messages(clinic_id, user, limit=12):
     conn = db_conn()
@@ -145,6 +198,7 @@ def load_recent_messages(clinic_id, user, limit=12):
     conn.close()
     rows.reverse()
     return [{"role": r, "content": t} for r, t in rows]
+
 
 def update_sheet_sync_status(appointment_id, status, error=None):
     try:
@@ -177,6 +231,7 @@ def update_sheet_sync_status(appointment_id, status, error=None):
     except Exception as e:
         print("update_sheet_sync_status FAILED:", repr(e))
 
+
 def get_unsynced_appointments(clinic_id, limit=20):
     conn = db_conn()
     c = conn.cursor()
@@ -195,6 +250,7 @@ def get_unsynced_appointments(clinic_id, limit=20):
     rows = c.fetchall()
     conn.close()
     return rows
+
 
 def cancel_latest_appointment(clinic_id, user):
     conn = db_conn()
@@ -226,6 +282,7 @@ def cancel_latest_appointment(clinic_id, user):
     conn.commit()
     conn.close()
     return {"id": appt_id, "name": name, "date": date, "time": time, "ref_code": ref_code}
+
 
 def cancel_by_ref(clinic_id, user, ref_code):
     conn = db_conn()
@@ -262,6 +319,7 @@ def cancel_by_ref(clinic_id, user, ref_code):
     conn.close()
     return {"id": appt_id, "name": name, "date": date, "time": time}
 
+
 def get_latest_booked_appointment(clinic_id, user):
     conn = db_conn()
     c = conn.cursor()
@@ -279,6 +337,7 @@ def get_latest_booked_appointment(clinic_id, user):
     conn.close()
     return row
 
+
 def get_todays_appointments(clinic_id, date_str):
     conn = db_conn()
     c = conn.cursor()
@@ -294,6 +353,7 @@ def get_todays_appointments(clinic_id, date_str):
     rows = c.fetchall()
     conn.close()
     return rows
+
 
 def load_clinic_settings(clinic_id):
     try:
@@ -313,6 +373,7 @@ def load_clinic_settings(clinic_id):
     except Exception as e:
         print("load_clinic_settings FAILED:", repr(e))
         return {}
+
 
 def get_state_and_draft(clinic_id, user):
     conn = db_conn()
@@ -335,6 +396,7 @@ def get_state_and_draft(clinic_id, user):
             draft = {}
     return (state or "idle", draft if isinstance(draft, dict) else {})
 
+
 def set_state_and_draft(clinic_id, user, state, draft):
     conn = db_conn()
     c = conn.cursor()
@@ -350,6 +412,7 @@ def set_state_and_draft(clinic_id, user, state, draft):
     )
     conn.commit()
     conn.close()
+
 
 def clear_state_machine(clinic_id, user):
     set_state_and_draft(clinic_id, user, "idle", {})

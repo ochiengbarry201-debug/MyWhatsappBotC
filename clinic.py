@@ -25,6 +25,26 @@ def resolve_clinic_id(to_number: str):
         return None
 
 
+def _default_twilio_settings():
+    return {
+        "parent_account_sid": "",
+        "subaccount_sid": "",
+        "subaccount_auth_token": "",
+        "whatsapp_sender": "",
+        "waba_id": "",
+        "business_name": "",
+        "onboarding_status": "draft",
+        "template_language": "en",
+        "templates": {
+            "appointment_reminder": {
+                "friendly_name": "appointment_reminder",
+                "content_sid": "",
+                "status": "not_created"
+            }
+        }
+    }
+
+
 def validate_clinic_settings(clinic_settings: dict):
     settings = clinic_settings if isinstance(clinic_settings, dict) else {}
 
@@ -129,7 +149,7 @@ def validate_clinic_settings(clinic_settings: dict):
         weekly = {}
 
     # Validate each weekday block shape
-    for day, blocks in weekly.items():
+    for day, blocks in list(weekly.items()):
         if blocks is None:
             weekly[day] = []
             continue
@@ -148,6 +168,66 @@ def validate_clinic_settings(clinic_settings: dict):
             if not start or not end:
                 errors.append(f"hours.weekly.{day}[{i}] must contain start and end")
 
+    # -----------------------------
+    # Twilio config
+    # -----------------------------
+    raw_twilio = settings.get("twilio", {})
+    if raw_twilio is None:
+        raw_twilio = {}
+    if not isinstance(raw_twilio, dict):
+        errors.append("twilio config must be an object/dict")
+        raw_twilio = {}
+
+    default_twilio = _default_twilio_settings()
+
+    twilio = {
+        "parent_account_sid": str(raw_twilio.get("parent_account_sid", default_twilio["parent_account_sid"]) or "").strip(),
+        "subaccount_sid": str(raw_twilio.get("subaccount_sid", default_twilio["subaccount_sid"]) or "").strip(),
+        "subaccount_auth_token": str(raw_twilio.get("subaccount_auth_token", default_twilio["subaccount_auth_token"]) or "").strip(),
+        "whatsapp_sender": str(raw_twilio.get("whatsapp_sender", default_twilio["whatsapp_sender"]) or "").strip(),
+        "waba_id": str(raw_twilio.get("waba_id", default_twilio["waba_id"]) or "").strip(),
+        "business_name": str(raw_twilio.get("business_name", default_twilio["business_name"]) or "").strip(),
+        "onboarding_status": str(raw_twilio.get("onboarding_status", default_twilio["onboarding_status"]) or "draft").strip(),
+        "template_language": str(raw_twilio.get("template_language", default_twilio["template_language"]) or "en").strip(),
+        "templates": {}
+    }
+
+    if not twilio["template_language"]:
+        twilio["template_language"] = "en"
+        warnings.append("twilio.template_language missing; defaulted to en")
+
+    raw_templates = raw_twilio.get("templates", {})
+    if raw_templates is None:
+        raw_templates = {}
+    if not isinstance(raw_templates, dict):
+        errors.append("twilio.templates must be an object/dict")
+        raw_templates = {}
+
+    merged_templates = {}
+    default_templates = default_twilio.get("templates", {})
+
+    # start with defaults
+    for key, value in default_templates.items():
+        merged_templates[key] = {
+            "friendly_name": str(value.get("friendly_name", key) or key).strip(),
+            "content_sid": str(value.get("content_sid", "") or "").strip(),
+            "status": str(value.get("status", "not_created") or "not_created").strip(),
+        }
+
+    # merge provided templates
+    for key, value in raw_templates.items():
+        if not isinstance(value, dict):
+            errors.append(f"twilio.templates.{key} must be an object/dict")
+            continue
+
+        merged_templates[key] = {
+            "friendly_name": str(value.get("friendly_name", key) or key).strip(),
+            "content_sid": str(value.get("content_sid", "") or "").strip(),
+            "status": str(value.get("status", "not_created") or "not_created").strip(),
+        }
+
+    twilio["templates"] = merged_templates
+
     cleaned = {
         "name": clinic_name,
         "admins": admins,
@@ -160,6 +240,7 @@ def validate_clinic_settings(clinic_settings: dict):
             "slot_minutes": slot_minutes,
             "weekly": weekly,
         },
+        "twilio": twilio,
     }
 
     return cleaned, errors, warnings

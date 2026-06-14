@@ -9,6 +9,7 @@ from flask import (
 
 from db import db_conn
 from clinic import validate_clinic_settings
+from clinic_twilio import mask_twilio_profile
 
 
 admin_dashboard_bp = Blueprint("admin_dashboard", __name__)
@@ -245,6 +246,7 @@ def admin_clinics():
         sheet = cleaned.get("sheet", {})
         hours = cleaned.get("hours", {})
         weekly = hours.get("weekly", {})
+        twilio = cleaned.get("twilio", {})
 
         table_rows.append(f"""
         <tr>
@@ -256,6 +258,8 @@ def admin_clinics():
             <td>{'Yes' if sheet.get('spreadsheet_id') else 'No'}</td>
             <td>{sheet.get('tab') or 'N/A'}</td>
             <td>{', '.join(sorted(list(weekly.keys()))) if weekly else 'none'}</td>
+            <td>{twilio.get('onboarding_status') or 'draft'}</td>
+            <td>{twilio.get('whatsapp_sender') or 'N/A'}</td>
             <td><span class="warn">{len(warnings)}</span></td>
             <td><span class="error">{len(errors)}</span></td>
         </tr>
@@ -277,10 +281,12 @@ def admin_clinics():
             <th>Sheet ID</th>
             <th>Sheet Tab</th>
             <th>Hours Days</th>
+            <th>Onboarding</th>
+            <th>Twilio Sender</th>
             <th>Warnings</th>
             <th>Errors</th>
         </tr>
-        {''.join(table_rows) if table_rows else '<tr><td colspan="10">No clinics found.</td></tr>'}
+        {''.join(table_rows) if table_rows else '<tr><td colspan="12">No clinics found.</td></tr>'}
     </table>
     """
     return _render_page("Clinics", content)
@@ -321,6 +327,23 @@ def admin_clinic_detail(clinic_id):
             settings = {}
 
     cleaned, errors, warnings = validate_clinic_settings(settings)
+    twilio_clean = cleaned.get("twilio", {})
+    twilio_masked = mask_twilio_profile(twilio_clean)
+
+    templates = twilio_masked.get("templates", {})
+    template_rows = []
+    if isinstance(templates, dict):
+        for template_key, template_info in templates.items():
+            if not isinstance(template_info, dict):
+                continue
+            template_rows.append(f"""
+            <tr>
+                <td>{template_key}</td>
+                <td>{template_info.get('friendly_name', '')}</td>
+                <td>{template_info.get('content_sid', '')}</td>
+                <td>{template_info.get('status', '')}</td>
+            </tr>
+            """)
 
     recent_bookings = _fetchall(
         """
@@ -362,6 +385,24 @@ def admin_clinic_detail(clinic_id):
         <pre>{json.dumps(warnings, indent=2, ensure_ascii=False)}</pre>
         <p><b>Errors:</b> <span class="error">{len(errors)}</span></p>
         <pre>{json.dumps(errors, indent=2, ensure_ascii=False)}</pre>
+    </div>
+
+    <div class="card">
+        <h2>Twilio Profile (Masked)</h2>
+        <pre>{json.dumps({k: v for k, v in twilio_masked.items() if k != 'templates'}, indent=2, ensure_ascii=False)}</pre>
+    </div>
+
+    <div class="card">
+        <h2>Twilio Templates</h2>
+        <table>
+            <tr>
+                <th>Template Key</th>
+                <th>Friendly Name</th>
+                <th>Content SID</th>
+                <th>Status</th>
+            </tr>
+            {''.join(template_rows) if template_rows else '<tr><td colspan="4">No templates found.</td></tr>'}
+        </table>
     </div>
 
     <div class="card">
